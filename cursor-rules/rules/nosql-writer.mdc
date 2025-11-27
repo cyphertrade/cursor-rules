@@ -1,0 +1,396 @@
+---
+description: MyNoSql writer integration (my-nosql-data-writer-sdk)
+alwaysApply: false
+---
+# MyNoSql writer integration (my-nosql-data-writer-sdk)
+
+MyNoSql is an internal NoSQL database used for storing settings and other configuration/operational data.
+
+It has two main parts:
+1. **Reader (TCP)** – keeps an in-memory copy inside the service.
+2. **Writer (REST API)** – used to write and update models in MyNoSql.
+
+This document describes **how to use the MyNoSql writer** from inside a service.
+
+> Important: if you need to access MyNoSql data **before the service has fully started** (for example, during startup or migrations), you MUST use the **writer**.  
+> The reader requires the service to start and sync the in-memory copy first.
+
+## 1. When to use the MyNoSql writer
+
+Use the writer when the service needs to:
+
+- **Create or update** data in MyNoSql (insert, update, delete rows/partitions).
+- Perform **administrative operations** on tables (create, clean, bulk insert).
+- Read data **before** the MyNoSql reader has warmed up (e.g., at startup).
+- Execute operations that must go directly against the central MyNoSql instance.
+
+Reader vs writer:
+- **Reader** – optimized for in-memory reads *after* the service is running.
+- **Writer** – REST-based client for reads/writes that do not depend on in-memory cache (can be used anytime, including during startup).
+
+## 2. Enabling the writer in a service
+
+To use the MyNoSql writer in a service:
+
+1. **Enable the writer feature** of `yft-service-sdk` in `Cargo.toml`:
+
+```toml
+[dependencies]
+yft-service-sdk = { path = "yft-service-sdk", features = ["my-nosql-data-writer-sdk", /* other features */] }
+```
+
+2. **Add the writer URL/endpoint to the settings model** (if it does not exist yet).
+
+In `src/settings.rs`:
+
+```rust
+use yft_service_sdk::external::my_settings_reader;
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    yft_service_sdk::macros::SdkSettingsTraits,
+    yft_service_sdk::macros::AutoGenerateSettingsTraits,
+    yft_service_sdk::external::my_settings_reader::SettingsModel,
+)]
+pub struct SettingsModel {
+    pub logs_host_port: String,
+
+    // MyNoSql reader endpoint (TCP, used by MyNoSqlDataReaderTcp)
+    pub my_no_sql_tcp_reader: String,
+
+    // MyNoSql writer endpoint (REST API base URL)
+    pub my_no_sql_writer: String,
+}
+```
+
+> The `SettingsModel` is expected to implement the `MyNoSqlWriterSettings` trait via the SDK macros, so that it can be passed into the writer.
+
+## 3. Creating a MyNoSqlDataWriter
+
+The generic writer type (simplified signature):
+
+```rust
+pub struct MyNoSqlDataWriter<TEntity: MyNoSqlEntity + Sync + Send> {
+    sync_period: DataSynchronizationPeriod,
+    phantom: PhantomData<TEntity>,
+    fl_url_factory: RequestFactory,
+}
+
+impl<TEntity: MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send> MyNoSqlDataWriter<TEntity> {
+    pub fn new(
+        settings: Arc<dyn MyNoSqlWriterSettings + Send + Sync + 'static>,
+        auto_create_table_params: Option<CreateTableParams>,
+        sync_period: DataSynchronizationPeriod,
+    ) -> Self;
+    // ...
+}
+```
+
+Typical construction pattern in a service:
+
+```rust
+use std::sync::Arc;
+use yft_service_sdk::external::my_no_sql_sdk::{
+    abstractions::{DataSynchronizationPeriod, MyNoSqlEntity, MyNoSqlEntitySerializer},
+    writer::{CreateTableParams, MyNoSqlDataWriter},
+};
+use crate::settings::SettingsReader; // usually wraps SettingsModel
+
+pub fn create_groups_writer(
+    settings: Arc<SettingsReader>,
+) -> MyNoSqlDataWriter<TradingGroupNoSqlEntity> {
+    MyNoSqlDataWriter::new(
+        settings.clone(),
+        Some(CreateTableParams {
+            persist: true,
+            max_partitions_amount: None,
+            max_rows_per_partition_amount: None,
+        }),
+        DataSynchronizationPeriod::Asap,
+    )
+}
+```
+
+> The entity type (`TradingGroupNoSqlEntity` in this example) comes from a shared models crate and must implement:
+>
+> `MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send + 'static`.
+
+## 4. Wiring the writer into AppContext
+
+As with the reader, writers should be wired through `AppContext`.
+
+1. **Add writer fields to `AppContext`** for each table you need to write:
+
+```rust
+use my_no_sql_sdk::writer::MyNoSqlDataWriter;
+
+#[derive(Clone)]
+pub struct AppContext {
+    pub groups_writer: Arc<MyNoSqlDataWriter<TradingGroupNoSqlEntity>>,
+    // ... other fields (readers, repos, caches)
+}
+```
+
+2. **Initialize them in `AppContext::new`**:
+
+```rust
+impl AppContext {
+    pub async fn new(
+        sc: &ServiceContext,
+        settings_reader: Arc<SettingsReader>,
+    ) -> Self {
+        let groups_writer = Arc::new(MyNoSqlDataWriter::<TradingGroupNoSqlEntity>::new(
+            settings_reader.clone(),
+            Some(CreateTableParams {
+                persist: true,
+                max_partitions_amount: None,
+                max_rows_per_partition_amount: None,
+            }),
+            DataSynchronizationPeriod::Asap,
+        ));
+
+        Self {
+            groups_writer,
+            // ... other dependencies
+        }
+    }
+}
+```
+
+3. **Use writers via `AppContext` in flows/repositories**:
+
+```rust
+pub async fn update_group_flow(
+    app: &AppContext,
+    input: UpdateGroupDto,
+) -> Result<(), FlowError> {
+    let entity = TradingGroupNoSqlEntity::from(input); // mapping DTO -> entity
+
+    app.groups_writer
+        .insert_or_replace_entity(&entity)
+        .await
+        .map_err(FlowError::from)?;
+
+    Ok(())
+}
+```
+
+Rules:
+- Do NOT construct `MyNoSqlDataWriter::new(...)` directly inside controllers/handlers.
+- Always store writers in `AppContext` (or in repositories that are fields of `AppContext`).
+- If table-level logic becomes non-trivial, wrap the writer in a repository struct and expose that from `AppContext` instead of the raw writer.
+
+## 5. Allowed usage by layer
+
+- **Controllers (HTTP/gRPC handlers)**:
+  - MUST NOT call `MyNoSqlDataWriter` directly.
+  - They should:
+    - map network models → DTOs,
+    - call flows,
+    - map DTOs/flow results → network responses.
+
+- **Flows (business logic)**:
+  - MAY use the writer via `AppContext` (directly or through repositories) to:
+    - insert/update/delete entities,
+    - perform bulk operations,
+    - read data if necessary (especially before reader is warmed up).
+  - Flows must not know about URLs, HTTP clients, or low-level request building.
+
+- **Repository / adapter layer**:
+  - Recommended place for table-specific operations using writer.
+  - Repositories expose methods like:
+    - `save_group`, `delete_group`, `load_all_groups`, etc.
+  - Flows call these repository methods instead of directly calling writer methods when logic becomes more complex.
+
+## 6. Startup and “before service start” behavior
+
+Important rule:
+
+- If you need to **read or prepare data before the service is fully started**, use the **writer**, not the reader.
+  - Example: verifying that required configuration rows exist before calling `start_application()`.
+  - Example: one-time migration that cleans a table and bulk-inserts default data.
+
+Why:
+- The MyNoSql reader (`MyNoSqlDataReaderTcp`) keeps an **in-memory copy** that is synchronized once the service is running.
+- Until the reader has connected and synced, it may not have the latest data.
+- The writer communicates directly with MyNoSql via REST and does not depend on the in-memory state of the running service.
+
+Pattern:
+
+```rust
+#[tokio::main]
+async fn main() {
+    let settings_reader = Arc::new(SettingsReader::new(".my-cfd-platform").await);
+
+    // You can create a writer here and perform startup checks / migrations
+    let groups_writer = MyNoSqlDataWriter::<TradingGroupNoSqlEntity>::new(
+        settings_reader.clone(),
+        Some(CreateTableParams {
+            persist: true,
+            max_partitions_amount: None,
+            max_rows_per_partition_amount: None,
+        }),
+        DataSynchronizationPeriod::Asap,
+    );
+
+    // e.g. ensure table exists or pre-load data
+    groups_writer
+        .create_table_if_not_exists(&CreateTableParams {
+            persist: true,
+            max_partitions_amount: None,
+            max_rows_per_partition_amount: None,
+        })
+        .await
+        .expect("failed to ensure groups table");
+
+    // Then continue with the usual ServiceContext / AppContext wiring
+    let mut service_context = ServiceContext::new(settings_reader.clone()).await;
+    let app_context = Arc::new(AppContext::new(&service_context, settings_reader.clone()).await);
+
+    service_context.start_application().await;
+}
+```
+
+## 7. Writer API overview and recommended operations
+
+The writer exposes a rich set of methods:
+
+```rust
+impl<TEntity: MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send> MyNoSqlDataWriter<TEntity> {
+    pub async fn create_table(
+        &self,
+        params: CreateTableParams,
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn create_table_if_not_exists(
+        &self,
+        params: &CreateTableParams,
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn insert_entity(
+        &self,
+        entity: &TEntity,
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn insert_or_replace_entity(
+        &self,
+        entity: &TEntity,
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn bulk_insert_or_replace(
+        &self,
+        entities: &[TEntity],
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn get_entity(
+        &self,
+        partition_key: &str,
+        row_key: &str,
+        update_read_statistics: Option<UpdateReadStatistics>,
+    ) -> Result<Option<TEntity>, DataWriterError>;
+
+    pub async fn get_by_partition_key(
+        &self,
+        partition_key: &str,
+        update_read_statistics: Option<UpdateReadStatistics>,
+    ) -> Result<Option<Vec<TEntity>>, DataWriterError>;
+
+    pub async fn get_enum_case_models_by_partition_key<
+        TResult: MyNoSqlEntity
+            + my_no_sql_abstractions::GetMyNoSqlEntitiesByPartitionKey
+            + From<TEntity>
+            + Sync
+            + Send
+            + 'static,
+    >(
+        &self,
+        update_read_statistics: Option<UpdateReadStatistics>,
+    ) -> Result<Option<Vec<TResult>>, DataWriterError>;
+
+    pub async fn get_enum_case_model<
+        TResult: MyNoSqlEntity
+            + From<TEntity>
+            + my_no_sql_abstractions::GetMyNoSqlEntity
+            + Sync
+            + Send
+            + 'static,
+    >(
+        &self,
+        update_read_statistics: Option<UpdateReadStatistics>,
+    ) -> Result<Option<TResult>, DataWriterError>;
+
+    pub async fn get_by_row_key(
+        &self,
+        row_key: &str,
+    ) -> Result<Option<Vec<TEntity>>, DataWriterError>;
+
+    pub async fn get_partition_keys(
+        &self,
+        skip: Option<i32>,
+        limit: Option<i32>,
+    ) -> Result<Vec<String>, DataWriterError>;
+
+    pub async fn delete_enum_case<
+        TResult: MyNoSqlEntity
+            + From<TEntity>
+            + my_no_sql_abstractions::GetMyNoSqlEntity
+            + Sync
+            + Send
+            + 'static,
+    >(
+        &self,
+    ) -> Result<Option<TResult>, DataWriterError>;
+
+    pub async fn delete_enum_case_with_row_key<
+        TResult: MyNoSqlEntity
+            + From<TEntity>
+            + my_no_sql_abstractions::GetMyNoSqlEntitiesByPartitionKey
+            + Sync
+            + Send
+            + 'static,
+    >(
+        &self,
+        row_key: &str,
+    ) -> Result<Option<TResult>, DataWriterError>;
+
+    pub async fn delete_row(
+        &self,
+        partition_key: &str,
+        row_key: &str,
+    ) -> Result<Option<TEntity>, DataWriterError>;
+
+    pub async fn delete_partitions(
+        &self,
+        partition_keys: &[&str],
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn get_all(
+        &self,
+    ) -> Result<Option<Vec<TEntity>>, DataWriterError>;
+
+    pub async fn clean_table_and_bulk_insert(
+        &self,
+        entities: &[TEntity],
+    ) -> Result<(), DataWriterError>;
+
+    pub async fn clean_partition_and_bulk_insert(
+        &self,
+        partition_key: &str,
+        entities: &[TEntity],
+    ) -> Result<(), DataWriterError>;
+}
+```
+
+Recommended patterns:
+- Use `insert_or_replace_entity` for idempotent upserts.
+- For small “configuration tables”, prefer `clean_table_and_bulk_insert` or `clean_partition_and_bulk_insert` to reset state atomically.
+- Use `create_table_if_not_exists` in startup/init flows to ensure tables exist.
+- Use `get_*` variants when you need **exact, centralized** state (especially at startup).
+
+Rules:
+- Keep writer usage in flows or repositories, not in controllers.
+- Always go through DTO ↔ entity mapping layers; do not expose raw MyNoSql entities to network models.
+- When possible, wrap writer calls into domain-specific repository methods to avoid duplicating MyNoSql-specific code across flows.

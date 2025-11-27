@@ -1,0 +1,309 @@
+---
+description: gRPC server integration with yft-service-sdk and ci-utils
+alwaysApply: false
+---
+# gRPC server integration (tonic + prost + ci-utils + yft-service-sdk)
+
+This rule describes how gRPC servers are added to a service using:
+
+- `yft-service-sdk` with the `grpc` feature
+- `tonic` and `prost`/`prost-types`
+- `ci-utils` as a build dependency to download and compile proto contracts
+- `AppContext` and `ServiceContext` for wiring
+
+The goal is to keep gRPC transport concerns separated from business logic and follow the same layered architecture (network models → DTO → flows).
+
+---
+
+## 1. Dependencies and build-dependencies
+
+To add a gRPC server to a service, you need:
+
+In `Cargo.toml`:
+
+```toml
+[build-dependencies]
+ci-utils = { git = "https://github.com/ITYFT/ci-utils.git", tag = "0.1.4" }
+
+[dependencies]
+yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", /* other features */] }
+tonic = "X.Y"
+prost = "X.Y"
+prost-types = "X.Y"
+```
+
+Rules:
+- `ci-utils` MUST be added under `[build-dependencies]` (not `[dependencies]`).
+- The service MUST enable the `grpc` feature on `yft-service-sdk` to get gRPC server support.
+- `tonic`, `prost` and `prost-types` MUST be present in dependencies for codegen and message types.
+- Prefer using the same versions of `tonic`/`prost` across services to avoid conflicts.
+
+---
+
+## 2. Proto contracts and build script (build.rs)
+
+Proto files are not stored manually. They are downloaded and compiled at build time using `ci-utils`.
+
+### 2.1. build.rs location
+
+- Create a `build.rs` file in the **root of the service crate**, next to `Cargo.toml`:
+
+```text
+PROJECT_ROOT/
+  Cargo.toml
+  build.rs
+  src/
+  ...
+```
+
+### 2.2. Typical build.rs using ci-utils
+
+Example pattern:
+
+```rust
+fn main() {
+    let url = "https://raw.githubusercontent.com/ITYFT/trading-engine-proto-contracts/master/";
+
+    ci_utils::sync_and_build_proto_file_with_builder(url, "TradingEngineAccounts.proto", |x| {
+        x.type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+    });
+}
+```
+
+Rules:
+- `url` is the base URL to the raw proto repository (e.g. GitHub raw URL).
+- The second parameter is the proto filename (e.g. `"TradingEngineAccounts.proto"`).
+- The closure can be used to add type-level attributes, for example deriving `serde::Serialize` / `serde::Deserialize` on all generated types.
+- `ci-utils` is responsible for:
+  - downloading the proto file(s) into a `proto/` directory at the crate root;
+  - invoking `prost_build` with correct parameters.
+
+If you are unsure which repo/URL or proto filename to use, ASK instead of guessing.
+
+### 2.3. Where proto files end up
+
+After running the build, proto files are available under:
+
+```text
+PROJECT_ROOT/proto/*.proto
+```
+
+`tonic::include_proto!` will use the package name from those proto files at runtime.
+
+---
+
+## 3. Including generated gRPC code in Rust
+
+Generated code is included via `tonic::include_proto!` inside a Rust module.
+
+Typical pattern in `src/main.rs` (or a dedicated `mod`):
+
+```rust
+pub mod trading_engine_grpc {
+    tonic::include_proto!("trading_engine");
+}
+```
+
+Naming rules:
+- The module name (`trading_engine_grpc`) is usually `<proto package> + "_grpc"`.
+- The argument to `tonic::include_proto!` (`"trading_engine"`) is the **exact package name** defined in the proto file:
+  - `package trading_engine;` → `tonic::include_proto!("trading_engine");`
+
+When adding a new proto contract:
+- Find the `package` name in the `.proto` file.
+- Create a module with `<package>_grpc` name and call `tonic::include_proto!("<package>")` inside it.
+
+---
+
+## 4. gRPC server struct and location
+
+Server implementations are stored under a dedicated gRPC directory, e.g.:
+
+```text
+src/grpc/grpc_server/<service_name>.rs
+```
+
+> Note: the directory name is `grpc_server` as used in this codebase convention.
+
+Inside that file, a server struct is defined, usually wrapping `Arc<AppContext>`:
+
+```rust
+use std::sync::Arc;
+use crate::app::AppContext;
+
+pub struct AccountsGrpcServer(pub Arc<AppContext>);
+```
+
+Naming rules:
+- The server struct name is typically `<ServiceName>GrpcServer`, where `<ServiceName>` is derived from the proto service (e.g. `Accounts`, `Orders`, etc.).
+- The inner field is `Arc<AppContext>` to give the server access to all dependencies (repositories, caches, flows, etc.).
+- The module file name usually reflects the server role, e.g. `accounts_grpc_server.rs` or similar, kept under `src/grpc/grpc_server/`.
+
+---
+
+## 5. Implementing the gRPC service trait
+
+From the proto file, you get a `service` definition, e.g.:
+
+```proto
+service TradingEngineAccountsService {
+    rpc CreateAccount(CreateAccountGrpcRequest) returns (CreateAccountGrpcResponse);
+}
+```
+
+After codegen, tonic will expose a server builder + trait, for example:
+
+```rust
+pub mod trading_engine_accounts_service_server {
+    pub struct TradingEngineAccountsServiceServer<T: TradingEngineAccountsService> { /* ... */ }
+
+    #[tonic::async_trait]
+    pub trait TradingEngineAccountsService { /* RPC methods here */ }
+}
+```
+
+> Naming pattern: the generated server type is always `<ProtoServiceName> + "Server"`,  
+> e.g. `TradingEngineAccountsService` (from proto) → `TradingEngineAccountsServiceServer` (Rust).
+
+You must implement this trait for your server struct:
+
+```rust
+use crate::trading_engine_grpc::trading_engine_accounts_service_server::TradingEngineAccountsService;
+use crate::trading_engine_grpc::{CreateAccountGrpcRequest, CreateAccountGrpcResponse};
+use crate::app::AppContext;
+use std::sync::Arc;
+
+pub struct AccountsGrpcServer(pub Arc<AppContext>);
+
+#[tonic::async_trait]
+impl TradingEngineAccountsService for AccountsGrpcServer {
+    async fn create_account(
+        &self,
+        request: tonic::Request<CreateAccountGrpcRequest>,
+    ) -> Result<tonic::Response<CreateAccountGrpcResponse>, tonic::Status> {
+        let request = request.into_inner();
+
+        // delegate to flow, using AppContext
+        let create_result = create_account(self.0.as_ref(), request.clone()).await;
+
+        // map flow result into gRPC response type
+        let response = CreateAccountGrpcResponse::from(create_result.clone());
+
+        Ok(tonic::Response::new(response))
+    }
+}
+```
+
+Rules:
+- Each `rpc` method in proto MUST have a corresponding async method in the Rust trait impl.
+- The first parameter is always `&self` (server), second is `tonic::Request<...>`.
+- The return type is always `Result<tonic::Response<...>, tonic::Status>` for unary calls.
+- Business logic lives in **flows** (e.g. `create_account(...)`) and uses DTOs; the gRPC server:
+  - unwraps the request;
+  - maps it to DTO if needed;
+  - calls the flow using `self.0` (the `AppContext`);
+  - maps flow result into the gRPC response type.
+
+The server methods MUST NOT contain complex business logic – they are an adapter between gRPC network models and flows.
+
+---
+
+## 6. Server-streaming RPCs and generate_server_stream! macro
+
+If a proto method uses a **server streaming** response, e.g.:
+
+```proto
+rpc GetClientAccounts(GetTraderAccountsGrpcRequest) returns (stream TradingEngineAccountGrpcModel);
+```
+
+Then, before implementing the service trait, you must use the helper macro:
+
+```rust
+generate_server_stream!(stream_name: "GetClientAccountsStream", item_name: "TradingEngineAccountGrpcModel");
+```
+
+Parameters:
+- `stream_name`: the Rust type name for the stream, typically `<ProtoMethodName> + "Stream"`, e.g. `"GetClientAccountsStream"`.
+- `item_name`: the proto model name for each streamed item, e.g. `"TradingEngineAccountGrpcModel"`.
+
+Rules:
+- The `stream_name` MUST correspond to the RPC name from proto, suffixed with `Stream` (e.g. `GetClientAccounts` → `GetClientAccountsStream`).
+- `item_name` MUST be the exact gRPC response message type used in the `stream` (e.g. `TradingEngineAccountGrpcModel`).
+
+The corresponding Rust method in the service trait will return a stream type based on `GetClientAccountsStream`. Inside the method, you construct and return that stream, emitting `TradingEngineAccountGrpcModel` items.
+
+Keep the same adapter pattern:
+- Convert request → DTO
+- Use flows to fetch data
+- Map DTOs → gRPC models in the stream
+
+---
+
+## 7. Wiring the gRPC server into ServiceContext (binding in main)
+
+Once the server struct and trait impl are defined, you must register (bind) the server with `ServiceContext` so that it starts listening when the service starts.
+
+Typical pattern in `main.rs` (or a dedicated setup function):
+
+```rust
+use std::sync::Arc;
+use yft_service_sdk::{GrpcServerBuilder, ServiceContext};
+use crate::trading_engine_grpc::trading_engine_accounts_service_server::TradingEngineAccountsServiceServer;
+use crate::grpc::grpc_server::accounts_grpc_server::AccountsGrpcServer;
+
+#[tokio::main]
+async fn main() {
+    let settings_reader = SettingsReader::new(".my-cfd-platform").await;
+    let settings_reader = Arc::new(settings_reader);
+
+    let mut service_context = ServiceContext::new(settings_reader.clone()).await;
+    let app_context = Arc::new(AppContext::new(&service_context, settings_reader.clone()).await);
+
+    // Configure and bind gRPC services
+    service_context.configure_grpc_server(|builder: &mut GrpcServerBuilder| {
+        builder.add_grpc_services(|x| {
+            x.add_service(TradingEngineAccountsServiceServer::new(AccountsGrpcServer(
+                app_context.clone(),
+            )))
+        });
+    });
+
+    service_context.start_application().await;
+}
+```
+
+Key points:
+- `TradingEngineAccountsServiceServer` is the generated tonic server type:
+  - pattern: `<ProtoServiceName> + "Server"`.
+- `AccountsGrpcServer` is your struct that implements the gRPC trait and holds `Arc<AppContext>`.
+- `builder.add_grpc_services(|x| { x.add_service(...); })` is the standard pattern used in this codebase to register one or more gRPC services.
+- `configure_grpc_server` MUST be called **before** `start_application().await`.
+
+Rules:
+- Always bind gRPC services via `ServiceContext::configure_grpc_server`.
+- Do NOT start a separate tonic server manually; let `ServiceContext` own the gRPC server lifecycle.
+- If multiple gRPC services are needed, register all of them inside the same `add_grpc_services` closure.
+
+---
+
+## 8. Summary of responsibilities
+
+- **Proto + build.rs (ci-utils)**:
+  - Download and compile proto files.
+  - Keep proto location/config centralized and reproducible.
+
+- **Generated module (tonic::include_proto!)**:
+  - Exposes gRPC traits, messages, and server types (e.g. `<ServiceName>Server`).
+
+- **gRPC server struct (e.g. AccountsGrpcServer)**:
+  - Wraps `Arc<AppContext>`.
+  - Implements the tonic service trait (one per proto service).
+  - Adapts between gRPC models and flows/DTOs.
+
+- **Flows and domain logic**:
+  - Perform business logic and work only with DTOs and repositories.
+  - Do not depend on gRPC/tonic types.
+
+- **ServiceContext**:
+  - Hosts the gRPC server via `configure_grpc_server` and `add_grpc_services`.
+  - Manages ports, metrics, and lifecycle.

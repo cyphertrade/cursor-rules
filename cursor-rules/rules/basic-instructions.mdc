@@ -1,0 +1,559 @@
+---
+description: Core architecture and SDK rules for YFT Rust microservices.
+globs: "src/**/*"
+alwaysApply: true
+---
+
+# YFT Rust Service Architecture & service-sdk Rules
+
+If you are missing critical information (e.g. which MyNoSql entity to use,
+what table name, what HTTP route path to choose), ASK ME A CLARIFYING QUESTION
+instead of guessing.
+
+These rules describe how Rust backend services in this monorepo are structured and how they must use `yft-service-sdk`, `AppContext`, and the common settings model.
+
+## 1. High-level principles
+
+- Every service is a Rust microservice using a shared `yft-service-sdk` crate.
+- All runtime wiring goes through `ServiceContext` from `yft-service-sdk`.
+- Every service has an `AppContext` that contains all dependencies (repos, caches, clients, etc.).
+- Every service uses Tokio as the async runtime.
+- Every service has a common settings file and settings model in `src/settings.rs`.
+- `main.rs` is only responsible for:
+  - loading settings
+  - creating `ServiceContext`
+  - building `AppContext`
+  - wiring HTTP/gRPC if needed
+  - starting the application
+
+## Cargo Build Verification Rule
+
+Before sending any Rust code (files, modules, structs, enums, flows, handlers,
+DTOs, adapters, settings, or any changes), you MUST:
+
+1. **Mentally run `cargo build`** on the updated project structure.
+2. Validate that the generated code:
+   - compiles successfully,
+   - has no missing imports,
+   - has no missing modules,
+   - has no unresolved paths,
+   - has no type mismatches,
+   - has no trait bound errors,
+   - has no macro errors,
+   - has no syntax errors.
+
+3. If the mental `cargo build` reveals ANY issue:
+   - Do NOT output the broken code.
+   - Fix the issue automatically OR ask me for clarification.
+   - Only after the code “passes” your mental `cargo build`, you may output it.
+
+4. You must always ensure:
+   - All modules you reference exist.
+   - All DTOs, flows, adapters, and types compile.
+   - All `mod.rs` updates are correct.
+   - All paths match real folder names (never placeholders).
+   - All derives are valid for the struct/enum you apply them to.
+
+### Hard rule:
+**Do NOT output any Rust code that would fail `cargo build`.**
+
+
+When editing or generating code:
+- Prefer following existing patterns from the repository over inventing new patterns.
+- Prefer small, focused changes in the appropriate module over big refactors.
+- Do not bypass `ServiceContext` or `AppContext` when adding new dependencies.
+
+## Strict Output Scope Rule (Do Not Invent or Pre-generate)
+
+When I ask you to create or modify something, you must:
+- Create **only and exactly** what I explicitly asked for.
+- Do NOT pre-generate related files (e.g. request models, response models, error models, DTO siblings, adapters, handlers, flows, repositories) unless I asked for them directly.
+- Do NOT create “supporting” or “helper” modules automatically.
+- Do NOT create placeholder implementations, mocks, or stubs unless explicitly requested.
+- Do NOT create network request/response models unless I explicitly ask for them.
+- Do NOT add new folders or modules unless they are required to fulfill the **exact request**.
+
+If I say “create a DTO”, you must create **only the DTO**, nothing else.
+If I say “add a flow”, you must create only the flow, not network models, not handlers, not adapters.
+
+If you think additional structures *might* be needed:
+- Ask me a clarifying question **instead of generating anything unrequested**.
+
+
+## X. Placeholders and folder names
+
+In this document we sometimes use `{placeholder}` notation inside paths or names,
+for example: `src/{domain}/...`.
+
+**Important rules:**
+
+- Any `{something}` is a **placeholder**, not a real folder or file name.
+- Never create directories or files literally named with braces, such as:
+  - `src/{domain}`
+  - `src/{domain}`
+  - `src/{adapter}`
+  - `src/{feature}`
+- When you see a placeholder like `{domain}`, `{feature}`, `{adapter}`, etc.:
+  1. Infer the concrete, meaningful name from the context (business/domain name).
+  2. Use that as the actual folder/file name.
+
+Examples:
+
+- `src/{domain}/...` →
+  - `src/users/...` for user-related logic,
+  - `src/trades/...` for trading logic,
+  - `src/affiliates/...` for affiliate/IB logic,
+  - `src/xp_progression/...` for XP/missions logic, etc.
+- `src/adapters/{something}/...` →
+  - `src/adapters/db/...` for DB-related adapters,
+  - `src/adapters/nosql/...` for MyNoSql entities,
+  - `src/adapters/http_clients/...` for external HTTP clients.
+
+If you are unsure which concrete name to use:
+- Prefer reusing an existing folder that already fits the context.
+- If no suitable folder exists, choose a short, clear name from the business/domain.
+- If still unclear, **ASK ME A CLARIFYING QUESTION** instead of inventing a weird or generic folder (and never use `src/{domain}`).
+
+
+## 2. Tokio runtime and main function
+
+Tokio is the standard async runtime for all services.
+
+Cargo rule:
+- Each service MUST depend on Tokio with macros enabled, for example:
+
+```toml
+[dependencies]
+tokio = { version = "X.Y", features = ["macros", "rt-multi-thread"] }
+```
+
+Main function rule:
+- The entrypoint MUST always have the Tokio macro and async main signature:
+
+```rust
+#[tokio::main]
+async fn main() {
+    // standard startup sequence (see minimal template below)
+}
+```
+
+- Do NOT use a plain `fn main()` for services.
+- Do NOT create custom runtimes manually in `main.rs`; always rely on `#[tokio::main]`.
+
+## 3. Settings file and SettingsModel
+
+Every service MUST have a settings file with a standard model at:
+
+- `src/settings.rs`
+
+This file defines the configuration model used by `yft-service-sdk` and the internal settings reader.
+
+Required imports and base model:
+
+```rust
+use yft_service_sdk::external::my_settings_reader;
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    yft_service_sdk::macros::SdkSettingsTraits,
+    yft_service_sdk::macros::AutoGenerateSettingsTraits,
+    yft_service_sdk::external::my_settings_reader::SettingsModel,
+)]
+pub struct SettingsModel {
+    pub logs_host_port: String,
+}
+```
+
+Rules:
+- The settings module MUST be called `settings` and placed at `src/settings.rs`.
+- There MUST be a `SettingsModel` struct with the derives shown above.
+  - It can be extended with additional fields as the service evolves.
+  - The field `logs_host_port: String` is part of the base model and should remain present unless explicitly removed across the codebase.
+- The derives MUST include:
+  - `serde::Serialize` and `serde::Deserialize` (so serde with `derive` feature is required in Cargo).
+  - `yft_service_sdk::macros::SdkSettingsTraits`
+  - `yft_service_sdk::macros::AutoGenerateSettingsTraits`
+  - `yft_service_sdk::external::my_settings_reader::SettingsModel`
+
+Serde rule:
+- The project MUST enable serde with the `derive` feature in `Cargo.toml`, for example:
+
+```toml
+[dependencies]
+serde = { version = "X.Y", features = ["derive"] }
+```
+
+Integration with the rest of the service:
+- The settings reader type (typically `SettingsReader`) is built based on this `SettingsModel`.
+- `SettingsReader` is used in `main.rs` and `AppContext::new(...)` to pass configuration into the service.
+- When you add new config fields to `SettingsModel`, they should be consumed in:
+  - `AppContext::new(...)` when wiring dependencies;
+  - any other modules that depend on configuration, always through the settings reader, not directly from environment variables.
+
+When modifying settings:
+- Extend the `SettingsModel` struct with new fields rather than creating new independent settings types.
+- Keep configuration purely declarative (no logic in `SettingsModel` itself).
+- Do NOT read environment variables directly in random modules; always go through the generated settings reader.
+
+## 4. AppContext (service dependency container)
+
+Location:
+- Each service MUST define an `AppContext` type in: `src/app/app_ctx.rs`.
+
+Responsibilities:
+- `AppContext` is the central dependency container for the service.
+- It holds everything required for the service’s business logic, for example:
+  - database repositories
+  - caches
+  - external HTTP/gRPC clients
+  - message bus clients
+  - configuration-derived values
+  - shared state used by handlers and background workers
+
+Constructor:
+- `AppContext` always has an async constructor with this pattern:
+
+```rust
+pub async fn new(
+    sc: &ServiceContext,
+    settings_reader: Arc<SettingsReader>,
+) -> Self {
+    // build and return AppContext
+}
+```
+
+- `ServiceContext` comes from `yft-service-sdk` and exposes runtime infrastructure
+  (HTTP/gRPC server, metrics, logging, DB pools, etc.).
+- `SettingsReader` is the service-specific settings provider wrapped in `Arc`.
+
+Rules:
+- When adding a new dependency (repository, cache, client, worker, etc.):
+  1. Add a field for it to `AppContext` in `src/app/app_ctx.rs`.
+  2. Initialize it inside `AppContext::new(...)`, using:
+     - `ServiceContext` helpers (DB pools, registries, etc.)
+     - `SettingsReader` options.
+  3. Expose it as a public field or via accessors, so handlers/workers can use it.
+
+- Do NOT:
+  - create alternative context types for the same service;
+  - construct repositories/clients directly inside handlers;
+  - put HTTP/gRPC-specific logic in `AppContext` (transport logic lives in API/transport modules).
+
+## 5. yft-service-sdk and ServiceContext
+
+All services MUST be wired through the shared `yft-service-sdk` crate.
+
+What `yft-service-sdk` provides (conceptual overview):
+- `ServiceContext` type that:
+  - bootstraps runtime (logging, panic hook, timers);
+  - configures and runs the Axum HTTP server;
+  - optionally configures and runs a gRPC server;
+  - exposes health and metrics endpoints:
+    - `/api/isalive` – service metadata;
+    - `/metrics` – Prometheus metrics.
+- HTTP metrics middleware (per-route counters, gauges, latency histograms).
+- gRPC server builder that wires tracing and Prometheus metrics.
+- Structured JSON logging via `tracing`.
+- Optional integrations via feature flags:
+  - `grpc`, `ws`, `ql`, `postgresql`, `sqlite`, `my-nosql-*`, `my-service-bus`, etc.
+- Proc macros in `yft-service-sdk-macros` for settings traits and integrations.
+
+Wiring pattern (always follow this flow):
+
+1. Create a `SettingsReader` instance and wrap it in `Arc<SettingsReader>`.
+2. Initialize `ServiceContext`:
+
+```rust
+let mut service_context = ServiceContext::new(settings_reader.clone()).await;
+```
+
+3. Build `AppContext` using both `service_context` and `settings_reader`:
+
+```rust
+let app_context = Arc::new(AppContext::new(&service_context, settings_reader.clone()).await);
+```
+
+4. (Optional) Configure HTTP routes via `service_context.init_http_router(...)`,
+   passing `app_context` as Axum state.
+5. (Optional) Configure gRPC server via `service_context.configure_grpc_server(...)`,
+   registering tonic services that depend on `app_context`.
+6. Start the service with `service_context.start_application().await`.
+
+Rules:
+- Do NOT start your own HTTP or gRPC servers outside `ServiceContext`.
+- Do NOT duplicate health/metrics endpoints; use those provided by the SDK.
+- Do NOT create custom tracing/logging setups that conflict with `ServiceContext`.
+
+- DO:
+  - obtain DB pools and other infra objects from `ServiceContext`;
+  - use SDK’s HTTP and gRPC helpers to register routes and services;
+  - use the provided metrics layers instead of writing your own wrappers for standard metrics.
+
+## 6. Minimal main.rs template
+
+Every service’s `main.rs` (or the main binary entry) should follow this structure:
+
+```rust
+use std::sync::Arc;
+use yft_service_sdk::ServiceContext;
+
+#[tokio::main]
+async fn main() {
+    // 1. Load settings
+    let settings_reader = SettingsReader::new(".my-cfd-platform").await;
+    let settings_reader = Arc::new(settings_reader);
+
+    // 2. Initialize the shared service runtime
+    let mut service_context = ServiceContext::new(settings_reader.clone()).await;
+
+    // 3. Build the application context with all dependencies
+    let app_context = Arc::new(AppContext::new(&service_context, settings_reader.clone()).await);
+
+    // 4. (Optional) Configure HTTP or gRPC here using service_context and app_context
+
+    // 5. Start the service
+    service_context.start_application().await;
+}
+```
+
+Rules for `main.rs`:
+- Only perform:
+  - settings loading;
+  - `ServiceContext` creation;
+  - `AppContext` creation;
+  - HTTP/gRPC wiring (if the service exposes APIs);
+  - calling `start_application()`.
+- Do NOT:
+  - put business logic in `main.rs`;
+  - perform DB queries directly in `main.rs`;
+  - construct repositories/clients directly in `main.rs`.
+
+## 7. How to modify or extend a service
+
+When adding new features, always do the following:
+
+1. Look for existing services that already use a similar pattern
+   (same SDK, similar endpoints, similar repos).
+2. Follow the same structure for:
+   - module placement (`src/app`, `src/{domain}`, `src/adapters`, `src/api`, etc.);
+   - naming conventions;
+   - error handling and logging patterns.
+3. Use `AppContext` as the central place for dependencies.
+4. Keep changes small and focused to the relevant module/layer.
+
+If you are unsure where to place something:
+- Domain/business logic → `src/{domain}/` (no infra types).
+- DB/NoSQL/client implementations → `src/adapters/...`.
+- HTTP/gRPC handlers and routing → `src/api/` or `src/transport/`.
+- Wiring dependencies together → `src/app/app_ctx.rs` and `main.rs`.
+
+The goal is to keep services consistent and predictable so the AI
+can safely extend them without breaking architecture conventions.
+
+## 8. Layered architecture, model types, and flows
+
+This codebase uses a layered architecture with a strict separation of responsibilities.
+
+There are **three kinds of models**:
+
+1. **Network models**  
+   - Used only on the HTTP/gRPC transport layer.  
+   - Represent request/response payloads from/to the outside world.  
+   - Live in API/transport modules (e.g. `src/api/...`, `src/transport/...`).  
+   - Never used directly in business logic, repositories, or storage.
+
+2. **DTOs (domain transfer objects)**  
+   - Internal domain structures used by business logic (flows).  
+   - Live in the domain layer (e.g. `src/{domain}/...`).  
+   - They are transport-agnostic and storage-agnostic.  
+   - Flows always work with DTOs, not network or data store models.
+
+3. **Data store models**  
+   - Represent how data is stored in databases / NoSQL / other persistent stores.  
+   - Live in the data access / adapters layer (e.g. `src/adapters/db/...`).  
+   - Used by repositories to read/write from storage.  
+   - Mapped to/from DTOs, never exposed to controllers directly.
+
+### 8.1. Controllers (HTTP/gRPC handlers)
+
+Controllers are thin adapters between the external world and business logic.
+
+Responsibilities:
+- Accept a **network model** (request).
+- Perform **basic validation** (required fields, formats, simple constraints).
+- Immediately **map the network model into a DTO**.
+- Call the corresponding **flow** with:
+  - `&AppContext`
+  - the DTO input
+- Receive the flow result `Result<Dto, Error>` and:
+  - map the DTO result into a **network response model**,
+  - map the error into an appropriate HTTP/gRPC error response.
+- Error - always in contest of service.
+  - error stays in src/error.rs
+  - for mapping library errors into service errors - we using anyhow library. 
+  
+
+Rules:
+- Controllers:
+  - MUST NOT access databases, caches, or external clients directly.
+  - MUST NOT use data store models.
+  - MUST NOT contain business logic beyond simple validation and mapping.
+- Controllers only coordinate:
+  - network → DTO,
+  - call flow,
+  - DTO → network.
+
+### 8.2. Flows (business logic)
+
+Business logic is implemented as **flows** – dedicated functions that execute a single business use case.
+
+Typical pattern:
+
+```rust
+pub async fn some_flow(
+    app: &AppContext,
+    input: SomeInputDto,
+) -> Result<SomeOutputDto, FlowError> {
+    // business logic working only with DTOs
+}
+
+## Related feature-specific rules
+
+- For MyNoSql reader integration, follow `.cursor/rules/nosql-reader.mdc`.
+```
+
+### 8.3 DTOs vs Network Models (strict separation)
+
+**DTOs are pure internal domain types.  
+They MUST NOT be used as request or response models.**
+
+Rules:
+
+- DTOs:
+  - Live only inside the domain layer (e.g. `src/users/...`, `src/trades/...`).
+  - Contain purely internal business data.
+  - Are never exposed to HTTP or gRPC directly.
+  - Must NOT include `#[derive(serde::Serialize, serde::Deserialize)]`
+    unless explicitly needed for internal persistence.
+
+- Request and response models:
+  - Must live only in the transport layer (HTTP/gRPC),  
+    e.g. `src/api/{domain}/http_models.rs` or `src/api/{domain}/grpc_models.rs`.
+  - Are the ONLY place where network-facing `Serialize` and `Deserialize` exist.
+  - Must not be placed in `src/{domain}` next to DTOs.
+
+### Absolutely forbidden:
+
+- Creating DTOs inside `src/api/...`.
+- Creating request/response models inside `src/{domain}/...`.
+- Using a DTO as a request or response model.
+- Adding “request” or “response” DTOs inside domain folders.
+
+### Required coding behaviour:
+
+When generating code for a use case:
+
+1. **Request in → request model (`api`)**
+2. **Map request → DTO (`domain`)**
+3. **Flow uses DTO only (`domain`)**
+4. **Flow result DTO → response model (`api`)**
+5. **Return response model to client**
+
+If context is unclear whether something should be a DTO or a network model,
+**ask a clarifying question instead of guessing.**
+
+## Validation Rules (validator crate only)
+
+All input validation MUST be performed exclusively using the `validator` crate.
+
+Rules:
+
+1. **Network models (HTTP / gRPC request models)**:
+   - MUST derive:
+     ```rust
+     #[derive(serde::Deserialize, validator::Validate)]
+     ```
+   - MUST use field-level annotations such as:
+     - `#[validate(length(min = 1))]`
+     - `#[validate(range(min = 0))]`
+     - `#[validate(email)]`
+     - `#[validate(url)]`
+     - `#[validate(custom = "...")]` when needed.
+
+2. **Controller / handler behavior**:
+   - Immediately after deserializing a request model, you MUST call:
+     ```rust
+     req.validate()?
+     ```
+   - Controllers **must not** implement manual validation logic.
+   - Controllers **must not** re-validate DTOs.
+   - Only request models are validated.
+
+3. **DTOs**:
+   - DTOs MUST NOT contain validation attributes.
+   - DTOs MUST NOT derive `Validate`.
+   - DTOs assume input is already validated.
+
+4. **Flows / business logic**:
+   - MUST NOT perform validation that belongs to the transport layer.
+   - They may check logical constraints (e.g. “user not found”, “insufficient funds”),
+     but not string/email/format validations.
+
+5. If `validator` cannot express a validation rule:
+   - Ask me a clarifying question.
+   - Do NOT invent custom validation without discussion.
+
+6. Forbidden:
+   - manual `if field.is_empty()` checks in network layer,
+   - regex validation implemented manually,
+   - custom parsing instead of validator,
+   - validating inside DTOs or flows.
+
+
+## Flow Placement Rule (flows folder required)
+
+All business logic flows MUST be located strictly inside:
+
+    src/flows/{domain}/...
+
+Where:
+
+- `{domain}` is a concrete business domain name inferred from context  
+  (e.g. `users`, `trades`, `affiliates`, `xp_progression`, `reports`, etc.).
+- `{domain}` is a placeholder and MUST NOT be used literally as folder name.
+
+### Rules:
+
+1. **All flows live in:**
+   `src/flows/{domain}/flow_name.rs`
+   or in a grouped module:
+   `src/flows/{domain}/mod.rs`
+
+2. **Never place flows in:**
+   - `src/{domain}/...`
+   - `src/domain/...`
+   - `src/api/...`
+   - `src/adapters/...`
+   - `src/app/...`
+   - root `src/flows.rs`
+
+3. For every new flow:
+   - create or reuse `src/flows/{domain}/`,
+   - file name must reflect the use case, e.g.:
+     - `create_user_flow.rs`
+     - `place_order_flow.rs`
+     - `calculate_xp_flow.rs`
+     - `activate_mission_flow.rs`
+
+4. Flows must contain **only domain logic**:
+   - They receive a DTO input,
+   - They return a DTO output,
+   - They must not perform request/response processing,
+   - They must not contain API, DB, HTTP, gRPC, or network code.
+
+5. If the correct `{domain}` is unclear:
+   - Ask me a clarifying question.
+

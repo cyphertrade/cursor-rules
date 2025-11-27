@@ -1,0 +1,271 @@
+---
+description: gRPC client integration with yft-service-sdk and generated clients
+alwaysApply: false
+---
+# gRPC client integration (tonic + yft-service-sdk macros)
+
+This rule describes how to add and use gRPC **clients** in a service using:
+
+- `yft-service-sdk` with the `grpc` feature enabled;
+- shared proto contracts (same as for gRPC servers);
+- generated client structs via `#[generate_grpc_client(...)]` macro;
+- `SettingsReader` implementing `GrpcClientSettings` for URL resolution;
+- `AppContext` wiring.
+
+The goal is to keep gRPC client usage consistent and configuration-driven.
+
+---
+
+## 1. Prerequisites and features
+
+To use a gRPC client in a service:
+
+1. Enable the `grpc` feature on `yft-service-sdk` in `Cargo.toml`:
+
+```toml
+[dependencies]
+yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", /* other features */] }
+tonic = "X.Y"
+prost = "X.Y"
+prost-types = "X.Y"
+```
+
+2. Ensure the proto file for this client is available and compiled, same as for the server:
+   - Use `build.rs` + `ci-utils` to download and build the proto.
+   - The proto file path used by the client macro must point to the generated proto file (e.g. `"./trading-engine/proto/TradingEnginePersistence.proto"`).
+
+> Rule: server and client for the same service MUST use the same proto contract and package.
+
+---
+
+## 2. Proto and build.rs reuse
+
+Client and server share the same proto-generation pipeline.
+
+If the proto is already configured for a gRPC server, reuse the same `build.rs` that uses `ci-utils`. If not, create it following the same pattern as for gRPC servers (download proto into `proto/` or `trading-engine/proto/` etc.).
+
+Example (server and client both use this):
+
+```rust
+fn main() {
+    let url = "https://raw.githubusercontent.com/ITYFT/trading-engine-proto-contracts/master/";
+
+    ci_utils::sync_and_build_proto_file_with_builder(url, "TradingEnginePersistence.proto", |x| {
+        x.type_attribute(".", "#[derive(serde::Serialize,serde::Deserialize)]")
+    });
+}
+```
+
+---
+
+## 3. gRPC client struct location and macro
+
+gRPC clients are defined in dedicated modules under:
+
+```text
+src/grpc/grpc_client/<client_name>.rs
+```
+
+Each client is a struct generated via a macro from `yft-service-sdk`.
+
+Example pattern:
+
+```rust
+yft_service_sdk::macros::use_grpc_client!();
+
+#[yft_service_sdk::external::my_grpc_extensions::client::generate_grpc_client(
+    proto_file: "./trading-engine/proto/TradingEnginePersistence.proto",
+    crate_ns: "crate::trading_engine_persistence_grpc",
+    retries: 3,
+    request_timeout_sec: 3,
+    ping_timeout_sec: 1,
+    ping_interval_sec: 3,
+)]
+pub struct TradingEnginePersistenceGrpcClient;
+```
+
+Parameters meaning:
+- `proto_file` – path to the compiled proto file relative to the crate root (e.g. `./trading-engine/proto/TradingEnginePersistence.proto` or `./proto/TradingEnginePersistence.proto` depending on your setup).
+- `crate_ns` – Rust module path where `tonic::include_proto!` for this package lives (e.g. `crate::trading_engine_persistence_grpc`).
+- `retries` – number of automatic retry attempts for requests.
+- `request_timeout_sec` – per-request timeout in seconds.
+- `ping_timeout_sec` – timeout for health/ping checks.
+- `ping_interval_sec` – interval between pings.
+
+Rules:
+- The client struct name follows the pattern `<ServiceName>GrpcClient` (e.g. `TradingEnginePersistenceGrpcClient`).
+- There MUST be a corresponding module with `tonic::include_proto!` for the package specified in `crate_ns`.
+- Do not manually implement low-level client logic; always use the `generate_grpc_client` macro.
+
+---
+
+## 4. Adding gRPC URL to settings
+
+Each gRPC client needs a configuration entry (URL/host:port) in the settings model.
+
+Example `SettingsModel` snippet in `src/settings.rs`:
+
+```rust
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    yft_service_sdk::macros::SdkSettingsTraits,
+    yft_service_sdk::macros::AutoGenerateSettingsTraits,
+    yft_service_sdk::external::my_settings_reader::SettingsModel,
+)]
+pub struct SettingsModel {
+    pub logs_host_port: String,
+    pub my_sb_tcp_host_port: String,
+    pub my_no_sql_writer: String,
+    pub my_no_sql_tcp_reader: String,
+
+    // gRPC endpoint for Trading Engine Persistence service
+    pub engine_persistence_grpc: String,
+}
+```
+
+Naming rule:
+- Field names are usually `<logical_service_name>_grpc`, e.g. `engine_persistence_grpc`, `accounts_grpc`, etc.
+
+You may add multiple `*_grpc` fields if the service talks to multiple gRPC backends.
+
+---
+
+## 5. GrpcClientSettings trait and SettingsReader implementation
+
+To make the generated clients work, `SettingsReader` must implement `GrpcClientSettings` so that client instances can resolve their base URL by service name.
+
+Trait definition (for reference):
+
+```rust
+#[async_trait::async_trait]
+pub trait GrpcClientSettings {
+    async fn get_grpc_url(&self, name: &'static str) -> String;
+}
+```
+
+Example implementation for `SettingsReader`:
+
+```rust
+use yft_service_sdk::external::my_grpc_extensions::client::GrpcClientSettings;
+use crate::grpc::grpc_client::trading_engine_persistence::TradingEnginePersistenceGrpcClient;
+
+pub struct GrpcUrl(pub String);
+
+#[async_trait::async_trait]
+impl GrpcClientSettings for SettingsReader {
+    async fn get_grpc_url(&self, name: &'static str) -> String {
+        let settings = self.get_settings().await;
+
+        if TradingEnginePersistenceGrpcClient::get_service_name() == name {
+            return settings.engine_persistence_grpc;
+        }
+
+        panic!("Settings not found");
+    }
+}
+```
+
+Rules:
+- Always compare `name` with `<ClientStruct>::get_service_name()` to decide which URL to return.
+- For multiple clients, extend this `if`/`match` logic:
+  - e.g. check `AccountsGrpcClient::get_service_name()` and return `settings.accounts_grpc`.
+- If no matching client is found, panic with a clear error (or handle it explicitly if you prefer a different strategy).
+
+> The `generate_grpc_client` macro provides the `get_service_name()` associated function, so you don’t hardcode the service name string yourself.
+
+---
+
+## 6. Wiring gRPC clients into AppContext
+
+Once the client struct and settings are ready, wire the client through `AppContext` so that flows can use it.
+
+Example:
+
+```rust
+use std::sync::Arc;
+use crate::grpc::grpc_client::trading_engine_persistence::TradingEnginePersistenceGrpcClient;
+
+#[derive(Clone)]
+pub struct AppContext {
+    pub engine_persistence_client: Arc<TradingEnginePersistenceGrpcClient>,
+    // ... other fields
+}
+
+impl AppContext {
+    pub async fn new(
+        sc: &ServiceContext,
+        settings_reader: Arc<SettingsReader>,
+    ) -> Self {
+        let engine_persistence_client =
+            Arc::new(TradingEnginePersistenceGrpcClient::new(settings_reader.clone()));
+
+        Self {
+            engine_persistence_client,
+            // ... init other dependencies
+        }
+    }
+}
+```
+
+Rules:
+- gRPC clients should be stored in `AppContext` (usually wrapped in `Arc<...>`).
+- Do NOT construct gRPC clients directly inside controllers / handlers.
+- Flows and repositories obtain the client via `AppContext`.
+- If needed, you can wrap gRPC clients into higher-level services (e.g. a `PersistenceService` that hides gRPC details).
+
+---
+
+## 7. Usage in flows and layering rules
+
+Layering must remain consistent with the project architecture:
+
+- **Controllers (HTTP/gRPC handlers)**:
+  - MUST NOT call gRPC clients directly.
+  - Should work with network models ↔ DTOs and call flows.
+
+- **Flows (business logic)**:
+  - MAY use gRPC clients via `AppContext` to call other services.
+  - Flows work with DTOs and map results into DTOs; they should not depend on transport details (no `tonic::Request`/`Response` types leaking into the domain).
+
+- **Repositories / adapter layer**:
+  - For complex integrations, create a repository or service wrapper around the gRPC client:
+    - e.g. `EnginePersistenceRepository` that exposes domain-level methods and internally uses `TradingEnginePersistenceGrpcClient`.
+
+Example usage in a flow:
+
+```rust
+pub async fn sync_account_to_persistence(
+    app: &AppContext,
+    input: SyncAccountDto,
+) -> Result<(), FlowError> {
+    let mut client = app.engine_persistence_client.clone();
+
+    // Build gRPC request model from DTO
+    let request_model = input.into_grpc_model();
+
+    client
+        .sync_account(request_model)
+        .await
+        .map_err(FlowError::from)?;
+
+    Ok(())
+}
+```
+
+Rules:
+- Keep gRPC-specific error handling localized (e.g. mapping to `FlowError`).
+- Do not propagate tonic errors (`tonic::Status`) into the domain; map them to your own error types instead.
+
+---
+
+## 8. Summary
+
+- Enable `grpc` feature on `yft-service-sdk` and ensure `tonic`/`prost` are present.
+- Use the same proto-generation pipeline (build.rs + ci-utils) for both gRPC servers and clients.
+- Define client structs in `src/grpc/grpc_client/...` using `#[generate_grpc_client(...)]` macro.
+- Add `*_grpc` URL fields to `SettingsModel` and implement `GrpcClientSettings` for `SettingsReader` using `<ClientStruct>::get_service_name()` checks.
+- Wire clients into `AppContext` and use them from flows (or repositories), not directly from controllers.
+- Treat gRPC as a transport detail: keep domain logic and DTOs separate from tonic-specific types.

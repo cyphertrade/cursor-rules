@@ -1,0 +1,362 @@
+---
+description: MyServiceBus integration (publishers & subscribers)
+alwaysApply: false
+---
+# MyServiceBus integration (publishers & subscribers)
+
+MyServiceBus is a custom message bus used as a message broker in this system.
+It supports two main roles:
+
+- **Publisher** – sends messages to a topic.
+- **Subscriber** – receives and handles messages from a topic.
+
+This rule describes how to add **publishers** and **subscribers** to a service
+using `yft-service-sdk` and how to wire them through `SettingsModel`, `ServiceContext`
+and `AppContext`.
+
+---
+
+## 1. Enabling MyServiceBus for a service
+
+To use MyServiceBus (publisher or subscriber) in a service:
+
+1. Enable the `my-service-bus` feature in `yft-service-sdk` in `Cargo.toml`:
+
+```toml
+[dependencies]
+yft-service-sdk = { path = "yft-service-sdk", features = ["my-service-bus", /* other features */] }
+```
+
+2. Add the TCP host/port setting to the settings model in `src/settings.rs`:
+
+```rust
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    yft_service_sdk::macros::SdkSettingsTraits,
+    yft_service_sdk::macros::AutoGenerateSettingsTraits,
+    yft_service_sdk::external::my_settings_reader::SettingsModel,
+)]
+pub struct SettingsModel {
+    pub logs_host_port: String,
+    pub my_no_sql_writer: String,
+    pub my_no_sql_tcp_reader: String,
+
+    // MyServiceBus TCP endpoint
+    pub my_sb_tcp_host_port: String,
+}
+```
+
+Once the feature is enabled and the setting is present, `ServiceContext` exposes helper
+methods to create publishers and register subscribers.
+
+---
+
+## 2. Publishers: basic concepts
+
+Publishers send messages of a specific model type `TModel` to a topic determined by
+the model's implementation of `GetMySbModelTopicId`.
+
+There are **two kinds** of publishers:
+
+1. **Simple publisher** – sends once and returns an error if the send fails.
+2. **Publisher with internal queue** – buffers messages and keeps retrying until they are sent successfully.
+
+Typical signatures in `ServiceContext`:
+
+```rust
+#[cfg(feature = "my-service-bus")]
+pub async fn get_sb_publisher<TModel: MySbMessageSerializer + GetMySbModelTopicId>(
+    &self,
+    do_retries: bool,
+) -> MyServiceBusPublisher<TModel> {
+    self.sb_client.get_publisher(do_retries).await
+}
+
+#[cfg(feature = "my-service-bus")]
+pub async fn get_sb_publisher_with_queue<
+    TModel: MySbMessageSerializer + GetMySbModelTopicId,
+>(
+    &self,
+) -> PublisherWithInternalQueue<TModel> {
+    self.sb_client.get_publisher_with_internal_queue().await
+}
+```
+
+Where:
+- `TModel` is a message type coming from external/shared model crates.
+- `TModel` MUST implement:
+  - `MySbMessageSerializer`
+  - `GetMySbModelTopicId`
+
+> Rule: Do NOT invent MyServiceBus models locally – use shared model types from existing crates.
+
+---
+
+## 3. Wiring publishers into AppContext
+
+Publishers are created via `ServiceContext` (in `AppContext::new`) and stored inside `AppContext` fields.
+
+Example in `AppContext`:
+
+```rust
+use my_service_bus_abstractions::{GetMySbModelTopicId, MySbMessageSerializer};
+use yft_service_sdk::external::my_service_bus::{MyServiceBusPublisher, PublisherWithInternalQueue};
+
+#[derive(Clone)]
+pub struct AppContext {
+    // Simple one-shot publisher (no internal queue)
+    pub bidask_publisher: MyServiceBusPublisher<BidAskSbModel>,
+
+    // Publisher with internal queue (retries until success)
+    pub bidask_publisher_with_queue: PublisherWithInternalQueue<BidAskSbModel>,
+
+    // ... other fields
+}
+```
+
+Initialization in `AppContext::new`:
+
+```rust
+impl AppContext {
+    pub async fn new(
+        sc: &ServiceContext,
+        settings_reader: Arc<SettingsReader>,
+    ) -> Self {
+        let bidask_publisher =
+            sc.get_sb_publisher::<BidAskSbModel>(/* do_retries: */ false).await;
+
+        let bidask_publisher_with_queue =
+            sc.get_sb_publisher_with_queue::<BidAskSbModel>().await;
+
+        Self {
+            bidask_publisher,
+            bidask_publisher_with_queue,
+            // ... other dependencies
+        }
+    }
+}
+```
+
+Rules:
+- Publishers MUST be created via `ServiceContext` helpers, not manually.
+- Publishers MUST be stored in `AppContext` (or in services/repositories that are fields of `AppContext`).
+- Controllers/handlers MUST NOT create publishers directly.
+
+Usage in flows:
+
+```rust
+pub async fn publish_bidask_update(
+    app: &AppContext,
+    model: BidAskSbModel,
+) -> Result<(), PublishError> {
+    app.bidask_publisher
+        .publish(model)
+        .await
+        .map_err(PublishError::from)
+}
+```
+
+Choose publisher type:
+- Use `MyServiceBusPublisher` when caller can handle/send errors and retries are not desired automatically.
+- Use `PublisherWithInternalQueue` for fire-and-forget, resilient publishing that should retry in the background.
+
+---
+
+## 4. Subscribers: high-level flow
+
+Subscribers listen to a topic and process messages using a callback implementation.
+
+Steps to add a subscriber:
+
+1. Ensure `my-service-bus` feature is enabled and `my_sb_tcp_host_port` exists in settings (see section 1).
+2. Create a subscriber module/file under:
+
+```text
+src/background/sb/<name>_subscriber.rs
+```
+
+3. Define a subscriber struct that holds `Arc<AppContext>`.
+4. Implement the `SubscriberCallback<TMessageModel>` trait for your struct.
+5. Register the subscriber in `main.rs` via `service_context.register_sb_subscribe(...)`
+   **before** `start_application().await`.
+
+---
+
+## 5. Subscriber struct and trait implementation
+
+### 5.1. Subscriber struct
+
+Example:
+
+```rust
+use std::sync::Arc;
+use crate::app::AppContext;
+
+pub struct BidAskSbSubscriber {
+    pub app: Arc<AppContext>,
+}
+
+impl BidAskSbSubscriber {
+    pub fn new(app: Arc<AppContext>) -> Self {
+        Self { app }
+    }
+}
+```
+
+### 5.2. SubscriberCallback trait
+
+Trait definition (for reference):
+
+```rust
+#[async_trait::async_trait]
+pub trait SubscriberCallback<
+    TMessageModel: MySbMessageDeserializer<Item = TMessageModel> + Send + Sync + 'static,
+>
+{
+    async fn handle_messages(
+        &self,
+        messages_reader: &mut MessagesReader<TMessageModel>,
+    ) -> Result<(), MySbSubscriberHandleError>;
+}
+```
+
+Example implementation (structure only, business logic is up to the developer):
+
+```rust
+use my_service_bus_abstractions::MySbMessageDeserializer;
+use my_service_bus_extensions::{MessagesReader, MySbSubscriberHandleError};
+use crate::background::sb::bidask_subscriber::BidAskSbSubscriber;
+use crate::sb_models::BidAskSbModel;
+
+#[async_trait::async_trait]
+impl SubscriberCallback<BidAskSbModel> for BidAskSbSubscriber {
+    async fn handle_messages(
+        &self,
+        messages_reader: &mut MessagesReader<BidAskSbModel>,
+    ) -> Result<(), MySbSubscriberHandleError> {
+        while let Some(messages) = messages_reader.get_all() {
+            let messages = messages
+                .into_iter()
+                .filter_map(|x| {
+                    let message = x.take_message();
+
+                    // Map raw SB message into domain DTO (example)
+                    let bidask_date = /* parse date from message */;
+
+                    // If parsing fails, skip message (example pattern)
+                    let Some(bidask_date) = bidask_date else {
+                        tracing::error!(?message, "Failed to parse bidask date. Skipping");
+                        return None;
+                    };
+
+                    Some(BidAsk {
+                        asset_pair: message.id,
+                        bid: message.bid,
+                        ask: message.ask,
+                        base: message.base,
+                        quote: message.quote,
+                        date: bidask_date,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            // Delegate to a flow or handler
+            handle_bidask_updates(self.app.as_ref(), messages).await;
+        }
+
+        Ok(())
+    }
+}
+```
+
+Rules:
+- `SubscriberCallback` is generic over `TMessageModel`, which MUST implement `MySbMessageDeserializer<Item = TMessageModel> + Send + Sync + 'static`.
+- The subscriber implementation:
+  - Reads messages via `messages_reader.get_all()`.
+  - Converts raw bus messages into DTOs/domain models.
+  - Delegates to flows (`handle_bidask_updates(...)` or similar), using `self.app` for dependencies.
+- Avoid putting complex business logic directly in `handle_messages`; keep it as an adapter that calls flows.
+
+---
+
+## 6. Registering a subscriber in main.rs
+
+Subscribers must be registered with `ServiceContext` before starting the application.
+
+Example pattern in `main.rs`:
+
+```rust
+use std::sync::Arc;
+use yft_service_sdk::external::my_service_bus::TopicQueueType;
+use crate::background::sb::bidask_subscriber::BidAskSbSubscriber;
+
+#[tokio::main]
+async fn main() {
+    let settings_reader = SettingsReader::new(".my-cfd-platform").await;
+    let settings_reader = Arc::new(settings_reader);
+
+    let mut service_context = ServiceContext::new(settings_reader.clone()).await;
+    let app_context = Arc::new(AppContext::new(&service_context, settings_reader.clone()).await);
+
+    // Register MyServiceBus subscriber(s) before starting the application
+    service_context
+        .register_sb_subscribe(
+            Arc::new(BidAskSbSubscriber::new(app_context.clone())),
+            TopicQueueType::PermanentWithSingleConnection,
+        )
+        .await;
+
+    service_context.start_application().await;
+}
+```
+
+### TopicQueueType
+
+Available queue types:
+
+```rust
+pub enum TopicQueueType {
+    Permanent = 0,
+    DeleteOnDisconnect = 1,
+    PermanentWithSingleConnection = 2,
+}
+```
+
+Guidance:
+- `Permanent` – queue persists and can be used by multiple connections.
+- `DeleteOnDisconnect` – queue is removed when connection is closed.
+- `PermanentWithSingleConnection` – queue persists but expects a single consumer connection.
+
+> Rule: Which `TopicQueueType` to use is **context-specific**. If it is not obvious from existing code or convention, ASK the developer which queue type they want for a new subscriber instead of guessing.
+
+---
+
+## 7. Layering and responsibilities
+
+- **SettingsModel / SettingsReader**:
+  - Provide `my_sb_tcp_host_port` setting.
+  - MyServiceBus connection details are derived from settings, not hard-coded.
+
+- **ServiceContext**:
+  - Owns MyServiceBus client connection.
+  - Provides helpers:
+    - `get_sb_publisher` and `get_sb_publisher_with_queue` for publishers.
+    - `register_sb_subscribe` for subscriber registration.
+
+- **AppContext**:
+  - Stores publishers (and optionally higher-level bus-related services) as fields.
+  - Exposes them to flows and background workers.
+
+- **Publishers**:
+  - Used from flows or repositories to emit domain events / messages.
+  - Should not be created in controllers directly.
+
+- **Subscribers**:
+  - Implement `SubscriberCallback` for specific message models.
+  - Convert bus messages → DTOs and call flows.
+  - Are registered in `main.rs` via `register_sb_subscribe(...)`.
+
+This keeps MyServiceBus integration consistent, testable, and aligned with the project’s layered architecture.
