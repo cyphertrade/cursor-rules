@@ -8,6 +8,7 @@ alwaysApply: false
 This rule describes how gRPC servers are added to a service using:
 
 - `yft-service-sdk` with the `grpc` feature (**and `macros` whenever gRPC is used**)
+- `tonic-prost` (**required by our code rules**)
 - `tonic` and `prost`/`prost-types`
 - `ci-utils` as a build dependency to download and compile proto contracts
 - `AppContext` and `ServiceContext` for wiring
@@ -29,7 +30,9 @@ ci-utils = { git = "https://github.com/ITYFT/ci-utils.git", tag = "0.1.4" }
 [dependencies]
 yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", "macros" /* other features */] }
 
-# gRPC core
+# gRPC core (required stack)
+tonic-prost = "*"
+
 tonic = "X.Y"
 prost = "X.Y"
 prost-types = "X.Y"
@@ -38,6 +41,7 @@ prost-types = "X.Y"
 Rules:
 - `ci-utils` MUST be added under `[build-dependencies]` (not `[dependencies]`).
 - If the service uses **gRPC server or gRPC client**, it MUST enable **both** `grpc` and `macros` features on `yft-service-sdk`.
+- `tonic-prost = "*"` MUST be present for any gRPC work (server or client).
 - `tonic`, `prost` and `prost-types` MUST be present in dependencies for codegen and message types
   (this is the required “tonic + prost” stack for gRPC).
 - Prefer using the same versions of `tonic`/`prost` across services to avoid conflicts.
