@@ -139,29 +139,29 @@ GraphQL is implemented using `async-graphql` and `async-graphql-axum`.
 GraphQL code lives under:
 
 ```text
-src/grapql/
+src/graphql/
 ```
 
-(Spelling as used in this codebase: `grapql`, not `graphql`.)
+(Use the standard spelling: `graphql`.)
 
 For each domain, there is a subfolder:
 
 ```text
-src/grapql/<domain>/
+src/graphql/<domain>/
 ```
 
 Inside a domain folder:
 
-- `src/grapql/<domain>/domain_query.rs` – GraphQL `Query` root for that domain.
-- `src/grapql/<domain>/domain_mutation.rs` – GraphQL `Mutation` root for that domain.
-- `src/grapql/<domain>/models/target_models.rs` – GraphQL models/objects/enums for that domain.
+- `src/graphql/<domain>/domain_query.rs` – GraphQL `Query` root for that domain.
+- `src/graphql/<domain>/domain_mutation.rs` – GraphQL `Mutation` root for that domain.
+- `src/graphql/<domain>/models/target_models.rs` – GraphQL models/objects/enums for that domain.
 
 Example:
 
 ```text
-src/grapql/reports/reports_query.rs
-src/grapql/reports/reports_mutation.rs
-src/grapql/reports/models/report_models.rs
+src/graphql/reports/reports_query.rs
+src/graphql/reports/reports_mutation.rs
+src/graphql/reports/models/report_models.rs
 ```
 
 Resolvers and models should follow the same layering rules:
@@ -173,15 +173,15 @@ Resolvers and models should follow the same layering rules:
 Each domain exposes a function to build its GraphQL schema in:
 
 ```text
-src/grapql/<domain>/mod.rs
+src/graphql/<domain>/mod.rs
 ```
 
 Example pattern:
 
 ```rust
 use async_graphql::{Schema, EmptySubscription};
-use crate::grapql::reports::reports_query::ReportsQueryRoot;
-use crate::grapql::reports::reports_mutation::ReportsMutationRoot;
+use crate::graphql::reports::reports_query::ReportsQueryRoot;
+use crate::graphql::reports::reports_mutation::ReportsMutationRoot;
 
 pub type ReportsSchema = Schema<ReportsQueryRoot, ReportsMutationRoot, EmptySubscription>;
 
@@ -204,7 +204,7 @@ depending on how the schema is wired in the concrete project.
 Top-level GraphQL HTTP endpoints are defined in:
 
 ```text
-src/grapql/mod.rs
+src/graphql/mod.rs
 ```
 
 Typical pattern:
@@ -221,9 +221,9 @@ use axum::{response, extract::State};
 use axum::response::IntoResponse;
 use http::HeaderMap;
 
-use crate::grapql::reports::ReportsSchema;
+use crate::graphql::reports::ReportsSchema;
 use crate::metrics::{HTTP_REQUESTS_COUNTER, GRAPHQL_REQUESTS_DURATION_HISTORGRAM};
-use crate::grapql::RequestHost;
+use crate::graphql::RequestHost;
 
 pub async fn graphiql() -> impl IntoResponse {
     response::Html(GraphiQLSource::build().endpoint("/api/reports/ql").finish())
@@ -283,7 +283,7 @@ Example:
 use std::sync::Arc;
 use axum::routing::get;
 use yft_service_sdk::external::axum::Router;
-use crate::grapql::{self, get_reports_schema};
+use crate::graphql::{self, get_reports_schema};
 use crate::app::AppContext;
 
 #[tokio::main]
@@ -300,7 +300,7 @@ async fn main() {
         Router::new()
             .route(
                 "/api/reports/ql",
-                get(grapql::graphiql).post(grapql::graphql_handler),
+                get(graphql::graphiql).post(graphql::graphql_handler),
             )
             .with_state(reports_schema)
             .with_state(app_context.clone()),
