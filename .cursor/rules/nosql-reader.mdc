@@ -1,7 +1,3 @@
----
-description: MyNoSql reader integration (my-nosql-data-reader-sdk)
-alwaysApply: false
----
 # MyNoSql reader integration (my-nosql-data-reader-sdk)
 
 MyNoSql is an internal NoSQL database used for storing settings and similar configuration data.
@@ -12,10 +8,34 @@ It is split into two parts:
 
 This document describes **how to use the MyNoSql reader** from inside a service.
 
+---
+
+## 0. Important: use the TCP reader type (avoid wrong paths)
+
+✅ **Always use** `MyNoSqlDataReaderTcp` (TCP reader).  
+❌ Do **not** use `MyNoSqlDataReader` in services.
+
+To avoid “wrong path” imports, follow these import patterns:
+
+```rust
+use std::sync::Arc;
+
+// Recommended reader import (via service SDK re-export)
+use yft_service_sdk::external::my_no_sql_sdk::reader::MyNoSqlDataReaderTcp;
+
+// Your MyNoSql entity types come from a separate models/contracts crate
+use cyphertrade_nosql_contracts::xp_progression::XpProgressionSettingsMyNoSqlEntity;
+use cyphertrade_nosql_contracts::user_group::UserGroupsNoSqlModel;
+```
+
+> The service should obtain readers from `ServiceContext::get_ns_reader::<T>()` and store them in `AppContext`.
+
+---
+
 ## 1. When to use the MyNoSql reader
 
 Use the MyNoSql reader when the service needs:
-- configuration data that must be **available in memory**, synced from a central MyNoSql instance;
+- configuration/reference data that must be **available in memory**, synced from a central MyNoSql instance;
 - **fast read access** to settings / reference data;
 - data that is naturally modeled as “tables” with partition and row keys.
 
@@ -23,20 +43,20 @@ The reader provides:
 - a background-syncing in-memory cache of a table;
 - convenient methods for snapshots, partition-based reads, and single-entity reads.
 
+---
+
 ## 2. Enabling the reader in a service
 
-When a service needs the MyNoSql reader:
-
-1. **Enable the service-sdk feature** in `Cargo.toml`:
+### 2.1 Enable the feature in `Cargo.toml`
 
 ```toml
 [dependencies]
-yft-service-sdk = { path = "yft-service-sdk", features = ["my-nosql-data-reader-sdk", /* other features */] }
+yft-service-sdk = { path = "yft-service-sdk", features = ["my-nosql-data-reader-sdk" /*, other features */] }
 ```
 
-2. **Ensure the TCP reader setting exists** in the service settings model.
+### 2.2 Ensure the TCP reader setting exists in the service settings model
 
-In `src/settings.rs` (example base model):
+Example (`src/settings.rs`):
 
 ```rust
 use yft_service_sdk::external::my_settings_reader;
@@ -52,11 +72,31 @@ use yft_service_sdk::external::my_settings_reader;
 )]
 pub struct SettingsModel {
     pub logs_host_port: String,
+
+    // required by reader connection wiring
     pub my_no_sql_tcp_reader: String,
 }
 ```
 
-3. After the feature is enabled and the setting is present, `ServiceContext` exposes a helper:
+---
+
+## 3. Where the MyNoSql models live
+
+- MyNoSql entity models are defined in **separate libraries** (internal crates/contracts).
+- They are **not** defined inside each service.
+- When using `get_ns_reader`, you pass the specific entity type from those libraries.
+
+The entity type must implement:
+
+```rust
+MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send + 'static
+```
+
+---
+
+## 4. Getting a reader from ServiceContext
+
+After the feature is enabled and the setting is present, `ServiceContext` exposes a helper:
 
 ```rust
 #[cfg(feature = "my-nosql-data-reader-sdk")]
@@ -74,123 +114,106 @@ pub async fn get_ns_reader<
 }
 ```
 
-> The caller specifies the concrete MyNoSql entity type (from a separate models crate) as the generic parameter.
+**Service-side rule:**  
+- Do **not** call `MyNoSqlDataReaderTcp::new(...)` directly in services.
+- Always obtain readers via `sc.get_ns_reader::<T>().await`.
 
-## 3. Where the MyNoSql models live
+---
 
-- MyNoSql entity models are defined in **separate libraries** (internal crates).
-- They are **not** defined inside each service.
-- When using `get_ns_reader`, you pass the specific entity type from those libraries, for example:
-
-```rust
-use my_models::TradingGroupNoSqlEntity;
-use my_no_sql_sdk::reader::MyNoSqlDataReaderTcp;
-```
-
-The entity type must implement:
-
-```rust
-MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send + 'static
-```
-
-as required by the reader.
-
-## 4. Wiring the reader into AppContext
+## 5. Wiring the reader into AppContext (recommended structure)
 
 For each table you want to read from MyNoSql:
 
-1. **Add a field to `AppContext`**:
+### 5.1 Add a field to `AppContext`
 
 ```rust
-use my_no_sql_sdk::reader::MyNoSqlDataReaderTcp;
 use std::sync::Arc;
+use yft_service_sdk::external::my_no_sql_sdk::reader::MyNoSqlDataReaderTcp;
+
+use cyphertrade_nosql_contracts::xp_progression::XpProgressionSettingsMyNoSqlEntity;
+use cyphertrade_nosql_contracts::user_group::UserGroupsNoSqlModel;
 
 #[derive(Clone)]
 pub struct AppContext {
-    pub groups_ns_reader: Arc<MyNoSqlDataReaderTcp<TradingGroupNoSqlEntity>>,
-    // ... other fields
+    pub xp_progression_settings_reader: Arc<MyNoSqlDataReaderTcp<XpProgressionSettingsMyNoSqlEntity>>,
+    pub user_groups_reader: Arc<MyNoSqlDataReaderTcp<UserGroupsNoSqlModel>>,
+
+    // ... other dependencies (db pool, repos, grpc clients, etc.)
 }
 ```
 
-2. **Initialize it in `AppContext::new` using `ServiceContext::get_ns_reader`**:
+### 5.2 Initialize in `AppContext::new` using `ServiceContext::get_ns_reader`
 
 ```rust
+use yft_service_sdk::ServiceContext;
+use std::sync::Arc;
+
 impl AppContext {
-    pub async fn new(
-        sc: &ServiceContext,
-        settings_reader: Arc<SettingsReader>,
-    ) -> Self {
-        let groups_ns_reader = sc.get_ns_reader::<TradingGroupNoSqlEntity>().await;
+    pub async fn new(sc: &ServiceContext, settings_reader: Arc<SettingsReader>) -> Self {
+        let xp_progression_settings_reader = sc
+            .get_ns_reader::<XpProgressionSettingsMyNoSqlEntity>()
+            .await;
+
+        let user_groups_reader = sc
+            .get_ns_reader::<UserGroupsNoSqlModel>()
+            .await;
 
         Self {
-            groups_ns_reader,
-            // ... initialize other dependencies
+            xp_progression_settings_reader,
+            user_groups_reader,
+            // ... initialize other deps
         }
     }
 }
 ```
 
-3. **Use the reader via `AppContext` in flows/services**:
+### 5.3 Use the reader via `AppContext` in flows/services
 
 ```rust
-pub async fn some_flow(
-    app: &AppContext,
-    input: SomeInputDto,
-) -> Result<SomeOutputDto, FlowError> {
+pub async fn some_flow(app: &AppContext) -> Result<(), FlowError> {
     let groups = app
-        .groups_ns_reader
+        .user_groups_reader
         .get_table_snapshot_as_vec()
         .await
         .unwrap_or_default();
 
-    // business logic using `groups` (DTOs / mapped entities)
+    // business logic using groups
+    Ok(())
 }
 ```
 
-Rules:
-- Do NOT construct `MyNoSqlDataReaderTcp::new(...)` directly in services.
-- Always obtain readers from `ServiceContext::get_ns_reader` and store them in `AppContext`.
+---
 
-## 5. Allowed usage by layer
+## 6. Allowed usage by layer
 
 - **Controllers (HTTP/gRPC handlers)**:
   - MUST NOT access `MyNoSqlDataReaderTcp` directly.
-  - They work only with DTOs and call flows.
+  - Work only with DTOs and call flows.
+
 - **Flows (business logic)**:
   - MAY use `MyNoSqlDataReaderTcp` via `AppContext` to read settings / reference data.
-  - They should not be aware of connection strings or low-level connection details.
-- **Repository / adapter layer**:
-  - If needed, you may wrap MyNoSql reads into a dedicated repository for a specific table.
-  - That repo is then exposed from `AppContext`, and flows call the repo instead of using the raw reader.
+  - Should not be aware of connection strings or low-level connection details.
 
-Goal:
+- **Repository / adapter layer**:
+  - If needed, wrap MyNoSql reads into a dedicated repository for a specific table.
+  - Expose that repo from `AppContext`, and flows call the repo instead of using the raw reader.
+
+**Goal:**
 - MyNoSql integration is **hidden behind AppContext** and (optionally) repositories.
 - No direct MyNoSql connection logic in controllers or random modules.
 
-## 6. Reader API overview and recommended patterns
+---
 
-The reader type (for reference):
+## 7. Reader API overview and recommended patterns
+
+The reader type:
 
 ```rust
 impl<TMyNoSqlEntity> MyNoSqlDataReaderTcp<TMyNoSqlEntity>
 where
     TMyNoSqlEntity: MyNoSqlEntity + MyNoSqlEntitySerializer + Sync + Send + 'static,
 {
-    pub async fn new(
-        app_states: Arc<dyn ApplicationStates + Send + Sync + 'static>,
-        sync_handler: Arc<SyncToMainNodeHandler>,
-    ) -> Self;
-
-    pub async fn get_table_snapshot(
-        &self,
-    ) -> Option<BTreeMap<String, BTreeMap<String, Arc<TMyNoSqlEntity>>>>;
-
     pub async fn get_table_snapshot_as_vec(&self) -> Option<Vec<Arc<TMyNoSqlEntity>>>;
-
-    pub async fn get_by_partition_key(
-        &self,
-        partition_key: &str,
-    ) -> Option<BTreeMap<String, Arc<TMyNoSqlEntity>>>;
 
     pub async fn get_by_partition_key_as_vec(
         &self,
@@ -203,84 +226,38 @@ where
         row_key: &str,
     ) -> Option<Arc<TMyNoSqlEntity>>;
 
-    pub fn get_entities<'s>(
-        &self,
-        partition_key: impl Into<StrOrString<'s>>,
-    ) -> GetEntitiesBuilder<TMyNoSqlEntity>;
-
-    pub fn get_entity_with_callback_to_server<'s>(
-        &'s self,
-        partition_key: &'s str,
-        row_key: &'s str,
-    ) -> GetEntityBuilder<TMyNoSqlEntity>;
-
     pub async fn has_partition(&self, partition_key: &str) -> bool;
 
-    pub async fn iter_and_find_entity_inside_partition(
-        &self,
-        partition_key: &str,
-        predicate: impl Fn(&TMyNoSqlEntity) -> bool,
-    ) -> Option<Arc<TMyNoSqlEntity>>;
-
-    pub fn deserialize_array(
-        &self,
-        data: &[u8],
-    ) -> BTreeMap<String, Vec<LazyMyNoSqlEntity<TMyNoSqlEntity>>>;
-
-    pub async fn get_enum_case_models_by_partition_key<
-        's,
-        TResult: MyNoSqlEntity
-            + my_no_sql_abstractions::GetMyNoSqlEntitiesByPartitionKey
-            + From<Arc<TMyNoSqlEntity>>
-            + Sync
-            + Send
-            + 'static,
-    >(
-        &self,
-    ) -> Option<Vec<TResult>>;
-
-    pub async fn get_enum_case_model<
-        TResult: MyNoSqlEntity
-            + From<Arc<TMyNoSqlEntity>>
-            + my_no_sql_abstractions::GetMyNoSqlEntity
-            + Sync
-            + Send
-            + 'static,
-    >(
-        &self,
-    ) -> Option<TResult>;
-
     pub async fn get_partition_keys(&self) -> Vec<String>;
+
+    // (other APIs omitted for brevity)
 }
 ```
 
-Recommended patterns for typical use cases:
+### Typical use cases
 
-- **Load entire table into memory (small config tables)**:
-
+**Load entire table into memory (small config tables):**
 ```rust
 let items = app
-    .groups_ns_reader
+    .xp_progression_settings_reader
     .get_table_snapshot_as_vec()
     .await
     .unwrap_or_default();
 ```
 
-- **Get all entities by partition key**:
-
+**Get all entities by partition key:**
 ```rust
 let items = app
-    .groups_ns_reader
+    .user_groups_reader
     .get_by_partition_key_as_vec(partition_key)
     .await
     .unwrap_or_default();
 ```
 
-- **Get a single entity**:
-
+**Get a single entity:**
 ```rust
 if let Some(entity) = app
-    .groups_ns_reader
+    .user_groups_reader
     .get_entity(partition_key, row_key)
     .await
 {
@@ -288,16 +265,24 @@ if let Some(entity) = app
 }
 ```
 
-- **Check if a partition exists**:
-
+**Check if a partition exists:**
 ```rust
 let exists = app
-    .groups_ns_reader
+    .user_groups_reader
     .has_partition(partition_key)
     .await;
 ```
 
-Rules:
-- Prefer the `*_as_vec` helpers for simple read flows.
-- Always start from `AppContext` to reach the reader.
-- Keep MyNoSql-specific logic out of controllers and network models.
+---
+
+## 8. Rules summary
+
+- ✅ Use **`MyNoSqlDataReaderTcp`** (TCP reader) everywhere in services.
+- ✅ Import the reader via:  
+  `yft_service_sdk::external::my_no_sql_sdk::reader::MyNoSqlDataReaderTcp`
+- ✅ Obtain readers only via:  
+  `sc.get_ns_reader::<T>().await`
+- ✅ Store readers in `AppContext` and pass `AppContext` into flows.
+- ❌ Do not construct readers manually (`MyNoSqlDataReaderTcp::new`) inside services.
+- ❌ Controllers must not touch readers directly.
+
