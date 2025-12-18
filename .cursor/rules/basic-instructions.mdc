@@ -345,14 +345,14 @@ When adding new features, always do the following:
 4. Keep changes small and focused to the relevant module/layer.
 
 If you are unsure where to place something:
-- Domain/business logic → `src/{domain}/` (no infra types).
+- Domain/business logic (flows, domain services) → `src/{domain}/` (no infra types).
+- DTOs (internal domain types used by flows) → `src/dto/{domain}/...`.
 - DB/NoSQL/client implementations → `src/adapters/...`.
 - HTTP/gRPC handlers and routing → `src/api/` or `src/transport/`.
 - Wiring dependencies together → `src/app/app_ctx.rs` and `main.rs`.
 
 The goal is to keep services consistent and predictable so the AI
 can safely extend them without breaking architecture conventions.
-
 ## 8. Layered architecture, model types, and flows
 
 This codebase uses a layered architecture with a strict separation of responsibilities.
@@ -367,7 +367,7 @@ There are **three kinds of models**:
 
 2. **DTOs (domain transfer objects)**  
    - Internal domain structures used by business logic (flows).  
-   - Live in the domain layer (e.g. `src/{domain}/...`).  
+   - Live under `src/dto/{domain}/...` (grouped by domain).  
    - They are transport-agnostic and storage-agnostic.  
    - Flows always work with DTOs, not network or data store models.
 
@@ -377,6 +377,32 @@ There are **three kinds of models**:
    - Used by repositories to read/write from storage.  
    - Mapped to/from DTOs, never exposed to controllers directly.
 
+### 8.0. Mapping between layers (trait-based conversions only)
+
+**Hard rule:** conversions between layers MUST be implemented as trait conversions, not “mapping functions”.
+
+**Priority order:**
+1. Implement `From<Source>` for `Target` (preferred).
+2. Use `.into()` at call sites (because `Into` is automatically available from `From`).
+3. For fallible conversions (validation/parsing), implement `TryFrom` / use `.try_into()`, wrap with `anyhow::Context`, then map into service errors.
+4. Only when `From` is impossible due to Rust orphan rules (e.g. converting `YourDto` → external type you don’t own),
+   implement `Into<ExternalType>` for your local type.
+
+**Applies to all boundaries:**
+- Network (HTTP/gRPC/GraphQL) request/response models ↔ DTOs
+- DTOs ↔ data store models (DB/NoSQL)
+- DTOs ↔ external service/client models
+
+**Forbidden:**
+- Free “mapper” functions like `to_dto()`, `from_dto()`, `map_*()`, `create_*()`.
+- Inline manual construction of DTOs/DB models inside controllers/flows when a trait impl can exist.
+
+**Required:**
+- Controllers/handlers convert:
+  - `let dto: XxxDto = req.into();` (or `req.try_into()?`)
+  - `let resp: XxxResponse = dto.into();`
+- Adapters/repositories convert DTOs ↔ storage/client models via `From`/`TryFrom` (or `Into` only when required by orphan rules).
+
 ### 8.1. Controllers (HTTP/gRPC handlers)
 
 Controllers are thin adapters between the external world and business logic.
@@ -384,17 +410,25 @@ Controllers are thin adapters between the external world and business logic.
 Responsibilities:
 - Accept a **network model** (request).
 - Perform **basic validation** (required fields, formats, simple constraints).
-- Immediately **map the network model into a DTO**.
+- Immediately **convert the network model into a DTO** using `From`/`TryFrom` (see **8.0**) — no manual mapping functions.
 - Call the corresponding **flow** with:
   - `&AppContext`
   - the DTO input
 - Receive the flow result `Result<Dto, Error>` and:
   - map the DTO result into a **network response model**,
   - map the error into an appropriate HTTP/gRPC error response.
-- Error - always in contest of service.
-  - error stays in src/error.rs
-  - for mapping library errors into service errors - we using anyhow library. 
-  
+#### Error handling rule (anyhow is mandatory)
+
+- Service/domain errors MUST live in `src/error.rs`.
+- `anyhow` MUST be used for:
+  - wrapping/annotating errors from external libraries (DB clients, HTTP clients, parsing, etc.),
+  - adding context via `anyhow::Context` at the failure boundary,
+  - bridging from “library error” → “service error” (stored in `src/error.rs`).
+
+Forbidden:
+- returning raw external/library errors upward without `anyhow` context,
+- ad-hoc/manual string error mapping when `anyhow::Context` is sufficient,
+- inventing custom mapping helpers instead of using `anyhow`.
 
 Rules:
 - Controllers:
@@ -430,41 +464,54 @@ pub async fn some_flow(
 **DTOs are pure internal domain types.  
 They MUST NOT be used as request or response models.**
 
-Rules:
+#### DTO placement (dto folder first)
+
+DTOs MUST live under:
+
+- `src/dto/{domain}/...`
+
+NOT under:
+
+- `src/{domain}/...`
+
+**Folder layout example** (domain: `auth`):
+
+```
+src/dto/
+  auth/
+    auth_dto.rs     # exactly ONE DTO type (preferred)
+    mapper.rs       # trait impls only (`From` / `TryFrom` / (rare) `Into`)
+    mod.rs
+```
+
+**File content rule (hard):**
+- Each DTO file MUST contain exactly ONE DTO type.
+- Only exception: DTOs that are extremely tightly coupled / logically inseparable may share a file.
+
+#### Separation rules
 
 - DTOs:
-  - Live only inside the domain layer (e.g. `src/users/...`, `src/trades/...`).
-  - Contain purely internal business data.
-  - Are never exposed to HTTP or gRPC directly.
-  - Must NOT include `#[derive(serde::Serialize, serde::Deserialize)]`
-    unless explicitly needed for internal persistence.
+  - Contain purely internal business data (transport-agnostic, storage-agnostic).
+  - Are never exposed to HTTP/gRPC/GraphQL directly.
+  - Must NOT derive `serde::Serialize` / `serde::Deserialize`
+    unless explicitly required for internal persistence.
 
-- Request and response models:
-  - Must live only in the transport layer (HTTP/gRPC),  
-    e.g. `src/api/{domain}/http_models.rs` or `src/api/{domain}/grpc_models.rs`.
-  - Are the ONLY place where network-facing `Serialize` and `Deserialize` exist.
-  - Must not be placed in `src/{domain}` next to DTOs.
+- Network request/response models:
+  - Must live only in the transport layer (HTTP/gRPC/GraphQL), e.g. `src/api/...` or `src/transport/...`.
+  - Must NOT be reused inside flows/domain logic.
 
-### Absolutely forbidden:
-
-- Creating DTOs inside `src/api/...`.
-- Creating request/response models inside `src/{domain}/...`.
-- Using a DTO as a request or response model.
-- Adding “request” or “response” DTOs inside domain folders.
-
-### Required coding behaviour:
+#### Required coding behaviour
 
 When generating code for a use case:
 
 1. **Request in → request model (`api`)**
-2. **Map request → DTO (`domain`)**
+2. **Convert request model → DTO (`dto`)** using trait conversions (see **8.0**)
 3. **Flow uses DTO only (`domain`)**
-4. **Flow result DTO → response model (`api`)**
+4. **Convert flow result DTO → response model (`api`)** using trait conversions (see **8.0**)
 5. **Return response model to client**
 
 If context is unclear whether something should be a DTO or a network model,
 **ask a clarifying question instead of guessing.**
-
 ## Validation Rules (validator crate only)
 
 All input validation MUST be performed exclusively using the `validator` crate.
@@ -556,4 +603,3 @@ Where:
 
 5. If the correct `{domain}` is unclear:
    - Ask me a clarifying question.
-
