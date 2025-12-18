@@ -18,16 +18,19 @@ The goal is to keep gRPC client usage consistent and configuration-driven.
 
 ## 1. Prerequisites and features
 
-To use a gRPC client in a service:
+To use a gRPC server **or** client in a service:
 
-1. Enable the `grpc` feature on `yft-service-sdk` in `Cargo.toml`:
+1. Enable **both** `grpc` **and** `macros` features on `yft-service-sdk` in `Cargo.toml`:
 
 ```toml
 [dependencies]
-yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", /* other features */] }
-tonic = "X.Y"
-prost = "X.Y"
-prost-types = "X.Y"
+yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", "macros" /* other features */] }
+
+# If we work with gRPC, tonic-prost = "*" is required
+tonic = "*"
+prost = "*"
+prost-types = "*"
+tonic-prost = "*"
 ```
 
 2. Ensure the proto file for this client is available and compiled, same as for the server:
@@ -263,7 +266,8 @@ Rules:
 
 ## 8. Summary
 
-- Enable `grpc` feature on `yft-service-sdk` and ensure `tonic`/`prost` are present.
+- Enable `grpc` and `macros` features on `yft-service-sdk` when using any gRPC server/client code.
+- If working with gRPC, `tonic-prost = "*"` is required (along with `tonic`, `prost`, `prost-types`).
 - Use the same proto-generation pipeline (build.rs + ci-utils) for both gRPC servers and clients.
 - Define client structs in `src/grpc/grpc_client/...` using `#[generate_grpc_client(...)]` macro.
 - Add `*_grpc` URL fields to `SettingsModel` and implement `GrpcClientSettings` for `SettingsReader` using `<ClientStruct>::get_service_name()` checks.
