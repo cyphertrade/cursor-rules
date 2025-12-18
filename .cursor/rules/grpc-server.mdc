@@ -2,11 +2,12 @@
 description: gRPC server integration with yft-service-sdk and ci-utils
 alwaysApply: false
 ---
+
 # gRPC server integration (tonic + prost + ci-utils + yft-service-sdk)
 
 This rule describes how gRPC servers are added to a service using:
 
-- `yft-service-sdk` with the `grpc` feature
+- `yft-service-sdk` with the `grpc` feature (**and `macros` whenever gRPC is used**)
 - `tonic` and `prost`/`prost-types`
 - `ci-utils` as a build dependency to download and compile proto contracts
 - `AppContext` and `ServiceContext` for wiring
@@ -17,7 +18,7 @@ The goal is to keep gRPC transport concerns separated from business logic and fo
 
 ## 1. Dependencies and build-dependencies
 
-To add a gRPC server to a service, you need:
+To add a gRPC server **or gRPC client** to a service, you need:
 
 In `Cargo.toml`:
 
@@ -26,7 +27,9 @@ In `Cargo.toml`:
 ci-utils = { git = "https://github.com/ITYFT/ci-utils.git", tag = "0.1.4" }
 
 [dependencies]
-yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", /* other features */] }
+yft-service-sdk = { path = "yft-service-sdk", features = ["grpc", "macros" /* other features */] }
+
+# gRPC core
 tonic = "X.Y"
 prost = "X.Y"
 prost-types = "X.Y"
@@ -34,8 +37,9 @@ prost-types = "X.Y"
 
 Rules:
 - `ci-utils` MUST be added under `[build-dependencies]` (not `[dependencies]`).
-- The service MUST enable the `grpc` feature on `yft-service-sdk` to get gRPC server support.
-- `tonic`, `prost` and `prost-types` MUST be present in dependencies for codegen and message types.
+- If the service uses **gRPC server or gRPC client**, it MUST enable **both** `grpc` and `macros` features on `yft-service-sdk`.
+- `tonic`, `prost` and `prost-types` MUST be present in dependencies for codegen and message types
+  (this is the required “tonic + prost” stack for gRPC).
 - Prefer using the same versions of `tonic`/`prost` across services to avoid conflicts.
 
 ---
@@ -73,7 +77,8 @@ fn main() {
 Rules:
 - `url` is the base URL to the raw proto repository (e.g. GitHub raw URL).
 - The second parameter is the proto filename (e.g. `"TradingEngineAccounts.proto"`).
-- The closure can be used to add type-level attributes, for example deriving `serde::Serialize` / `serde::Deserialize` on all generated types.
+- The closure can be used to add type-level attributes, for example deriving
+  `serde::Serialize` / `serde::Deserialize` on all generated types.
 - `ci-utils` is responsible for:
   - downloading the proto file(s) into a `proto/` directory at the crate root;
   - invoking `prost_build` with correct parameters.
@@ -106,7 +111,8 @@ pub mod trading_engine_grpc {
 
 Naming rules:
 - The module name (`trading_engine_grpc`) is usually `<proto package> + "_grpc"`.
-- The argument to `tonic::include_proto!` (`"trading_engine"`) is the **exact package name** defined in the proto file:
+- The argument to `tonic::include_proto!` (`"trading_engine"`) is the **exact package name**
+  defined in the proto file:
   - `package trading_engine;` → `tonic::include_proto!("trading_engine");`
 
 When adding a new proto contract:
@@ -135,9 +141,12 @@ pub struct AccountsGrpcServer(pub Arc<AppContext>);
 ```
 
 Naming rules:
-- The server struct name is typically `<ServiceName>GrpcServer`, where `<ServiceName>` is derived from the proto service (e.g. `Accounts`, `Orders`, etc.).
-- The inner field is `Arc<AppContext>` to give the server access to all dependencies (repositories, caches, flows, etc.).
-- The module file name usually reflects the server role, e.g. `accounts_grpc_server.rs` or similar, kept under `src/grpc/grpc_server/`.
+- The server struct name is typically `<ServiceName>GrpcServer`, where `<ServiceName>` is derived
+  from the proto service (e.g. `Accounts`, `Orders`, etc.).
+- The inner field is `Arc<AppContext>` to give the server access to all dependencies
+  (repositories, caches, flows, etc.).
+- The module file name usually reflects the server role, e.g. `accounts_grpc_server.rs` or similar,
+  kept under `src/grpc/grpc_server/`.
 
 ---
 
@@ -187,7 +196,7 @@ impl TradingEngineAccountsService for AccountsGrpcServer {
         let create_result = create_account(self.0.as_ref(), request.clone()).await;
 
         // map flow result into gRPC response type
-        let response = CreateAccountGrpcResponse::from(create_result.clone());
+        let response = CreateAccountGrpcResponse::from(create_result);
 
         Ok(tonic::Response::new(response))
     }
@@ -198,17 +207,146 @@ Rules:
 - Each `rpc` method in proto MUST have a corresponding async method in the Rust trait impl.
 - The first parameter is always `&self` (server), second is `tonic::Request<...>`.
 - The return type is always `Result<tonic::Response<...>, tonic::Status>` for unary calls.
-- Business logic lives in **flows** (e.g. `create_account(...)`) and uses DTOs; the gRPC server:
+- Business logic lives in **flows** and uses DTOs; the gRPC server:
   - unwraps the request;
   - maps it to DTO if needed;
   - calls the flow using `self.0` (the `AppContext`);
   - maps flow result into the gRPC response type.
-
-The server methods MUST NOT contain complex business logic – they are an adapter between gRPC network models and flows.
+- The server methods MUST NOT contain complex business logic – they are an adapter between gRPC network models and flows.
 
 ---
 
-## 6. Server-streaming RPCs and generate_server_stream! macro
+## 6. Error handling: always return Ok(Response), business errors go inside oneof
+
+### 6.1. Policy
+
+If a gRPC response contains a `oneof` with an `Error` variant (recommended pattern), then:
+
+- **Domain/business errors MUST NOT be returned as `tonic::Status`.**
+- Instead, you MUST return `Ok(tonic::Response::new(...))` and put the error into the response `oneof`.
+- `Err(tonic::Status)` should be reserved for truly transport/infrastructure failures where you
+  cannot produce a valid response message at all.
+
+### 6.2. Example (Verify)
+
+Proto:
+
+```proto
+rpc VerifyUserCredentials (VerifyUserCredentialsGrpcRequest) returns (VerifyUserCredentialsGrpcResponse);
+
+message VerifyUserCredentialsGrpcRequest{
+    string Email = 1;
+    string Password = 2;
+}
+
+message VerifyUserCredentialsGrpcResponse{
+    oneof VerifyUserCredentialsResult{
+        UserGrpcModel User = 1;
+        UsersGrpcError Error = 2;
+    }
+}
+```
+
+Server method pattern:
+
+```rust
+#[tonic::async_trait]
+impl AuthService for AuthGrpcServer {
+    async fn verify_user_credentials(
+        &self,
+        request: tonic::Request<VerifyUserCredentialsGrpcRequest>,
+    ) -> Result<tonic::Response<VerifyUserCredentialsGrpcResponse>, tonic::Status> {
+        let req = request.into_inner();
+
+        let domain_result = verify_user_credentials_flow(
+            self.0.as_ref(),
+            req.email,
+            req.password,
+        ).await;
+
+        let resp = match domain_result {
+            Ok(user) => VerifyUserCredentialsGrpcResponse {
+                verify_user_credentials_result: Some(
+                    verify_user_credentials_grpc_response::VerifyUserCredentialsResult::User(
+                        UserGrpcModel::from(user),
+                    ),
+                ),
+            },
+            Err(domain_err) => VerifyUserCredentialsGrpcResponse {
+                verify_user_credentials_result: Some(
+                    verify_user_credentials_grpc_response::VerifyUserCredentialsResult::Error(
+                        domain_err.into(),
+                    ),
+                ),
+            },
+        };
+
+        Ok(tonic::Response::new(resp))
+    }
+}
+```
+
+---
+
+## 7. Error mapping: MUST be implemented via `From`
+
+### 7.1. Policy
+
+- Do NOT map errors inline inside gRPC methods.
+- Implement conversions via `From`, and use `.into()` in handlers.
+
+This makes error mapping:
+- centralized,
+- consistent across endpoints,
+- easier to evolve.
+
+### 7.2. Example
+
+```rust
+// Domain layer
+pub enum DomainError {
+    InvalidCredentials,
+    UserBlocked,
+}
+
+// Protobuf-generated (or wrapper) gRPC error type
+pub struct UsersGrpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl From<DomainError> for UsersGrpcError {
+    fn from(err: DomainError) -> Self {
+        match err {
+            DomainError::InvalidCredentials => Self {
+                code: 1,
+                message: "Invalid email or password".to_string(),
+            },
+            DomainError::UserBlocked => Self {
+                code: 2,
+                message: "User is blocked".to_string(),
+            },
+        }
+    }
+}
+```
+
+Usage in a gRPC method:
+
+```rust
+let resp = match domain_result {
+    Ok(user) => /* ... */,
+    Err(domain_err) => VerifyUserCredentialsGrpcResponse {
+        verify_user_credentials_result: Some(Result::Error(domain_err.into())),
+    },
+};
+
+Ok(tonic::Response::new(resp))
+```
+
+---
+
+## 8. Server-streaming RPCs and generate_server_stream! macro
 
 If a proto method uses a **server streaming** response, e.g.:
 
@@ -223,14 +361,15 @@ generate_server_stream!(stream_name: "GetClientAccountsStream", item_name: "Trad
 ```
 
 Parameters:
-- `stream_name`: the Rust type name for the stream, typically `<ProtoMethodName> + "Stream"`, e.g. `"GetClientAccountsStream"`.
+- `stream_name`: the Rust type name for the stream, typically `<ProtoMethodName> + "Stream"`,
+  e.g. `"GetClientAccountsStream"`.
 - `item_name`: the proto model name for each streamed item, e.g. `"TradingEngineAccountGrpcModel"`.
 
 Rules:
-- The `stream_name` MUST correspond to the RPC name from proto, suffixed with `Stream` (e.g. `GetClientAccounts` → `GetClientAccountsStream`).
-- `item_name` MUST be the exact gRPC response message type used in the `stream` (e.g. `TradingEngineAccountGrpcModel`).
-
-The corresponding Rust method in the service trait will return a stream type based on `GetClientAccountsStream`. Inside the method, you construct and return that stream, emitting `TradingEngineAccountGrpcModel` items.
+- The `stream_name` MUST correspond to the RPC name from proto, suffixed with `Stream`
+  (e.g. `GetClientAccounts` → `GetClientAccountsStream`).
+- `item_name` MUST be the exact gRPC response message type used in the `stream`
+  (e.g. `TradingEngineAccountGrpcModel`).
 
 Keep the same adapter pattern:
 - Convert request → DTO
@@ -239,9 +378,10 @@ Keep the same adapter pattern:
 
 ---
 
-## 7. Wiring the gRPC server into ServiceContext (binding in main)
+## 9. Wiring the gRPC server into ServiceContext (binding in main)
 
-Once the server struct and trait impl are defined, you must register (bind) the server with `ServiceContext` so that it starts listening when the service starts.
+Once the server struct and trait impl are defined, you must register (bind) the server with
+`ServiceContext` so that it starts listening when the service starts.
 
 Typical pattern in `main.rs` (or a dedicated setup function):
 
@@ -276,7 +416,8 @@ Key points:
 - `TradingEngineAccountsServiceServer` is the generated tonic server type:
   - pattern: `<ProtoServiceName> + "Server"`.
 - `AccountsGrpcServer` is your struct that implements the gRPC trait and holds `Arc<AppContext>`.
-- `builder.add_grpc_services(|x| { x.add_service(...); })` is the standard pattern used in this codebase to register one or more gRPC services.
+- `builder.add_grpc_services(|x| { x.add_service(...); })` is the standard pattern used in this codebase
+  to register one or more gRPC services.
 - `configure_grpc_server` MUST be called **before** `start_application().await`.
 
 Rules:
@@ -286,7 +427,7 @@ Rules:
 
 ---
 
-## 8. Summary of responsibilities
+## 10. Summary of responsibilities
 
 - **Proto + build.rs (ci-utils)**:
   - Download and compile proto files.
@@ -299,6 +440,11 @@ Rules:
   - Wraps `Arc<AppContext>`.
   - Implements the tonic service trait (one per proto service).
   - Adapts between gRPC models and flows/DTOs.
+  - Returns `Ok(tonic::Response::new(...))` and uses oneof `Error` for business errors.
+
+- **Error mapping**:
+  - MUST be done via `From` implementations (DomainError → GrpcError).
+  - gRPC methods should use `.into()` rather than inline mapping.
 
 - **Flows and domain logic**:
   - Perform business logic and work only with DTOs and repositories.
